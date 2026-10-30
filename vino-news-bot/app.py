@@ -55,6 +55,29 @@ def parse_feed(body):
 
 def parse_html(body, source):
     soup = BeautifulSoup(body, "html.parser")
+
+    # VinoItaliano is a static site: the title is a .grey-background
+    # sibling and the following non-button link is the article itself.
+    vino_main = soup.select_one("#mainnew")
+    if vino_main:
+        vino_items = []
+        for heading in vino_main.select(".grey-background"):
+            article = heading.find_next("a", href=True)
+            while article and article.get("id") == "button1":
+                article = article.find_next("a", href=True)
+            if not article:
+                continue
+            title = clean_text(heading.get_text(" ", strip=True))
+            href = urljoin(source, article["href"])
+            if title and href and is_same_site(href, source):
+                vino_items.append({
+                    "url": href,
+                    "title": title,
+                    "summary": clean_text(article.get_text(" ", strip=True))[:700],
+                })
+        if vino_items:
+            return vino_items[:50]
+
     selectors = ["article h1 a", "article h2 a", "article h3 a", ".entry-title a", ".post-title a", "main h2 a", "main h3 a"]
     anchors = []
     for selector in selectors:

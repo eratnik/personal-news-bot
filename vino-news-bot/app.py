@@ -95,8 +95,26 @@ async def fetch_items(client, source):
             LOG.info("%s: using article-page extraction", source)
         return items
     except httpx.HTTPError as error:
-        LOG.warning("%s: cannot retrieve source: %s", source, error)
-        return []
+        https_error = error
+
+    # Some legacy public sites still offer plain HTTP but cannot negotiate
+    # current TLS. Do not follow redirects here: an HTTPS redirect would
+    # merely repeat the failed handshake.
+    if source.startswith("https://"):
+        fallback = "http://" + source.removeprefix("https://")
+        try:
+            response = await client.get(fallback, follow_redirects=False)
+            response.raise_for_status()
+            items = parse_feed(response.content) or parse_html(response.text, fallback)
+            if items:
+                LOG.info("%s: using HTTP fallback for legacy TLS", source)
+                return items
+        except (httpx.HTTPError, ValueError) as http_error:
+            LOG.warning("%s: cannot retrieve source over HTTPS (%s) or HTTP (%s)", source, https_error, http_error)
+            return []
+
+    LOG.warning("%s: cannot retrieve source: %s", source, https_error)
+    return []
 
 
 async def send_message(client, token, chat_id, item, source):

@@ -98,6 +98,17 @@ def parse_html(body, source):
     return found[:50]
 
 
+def vk_group_id(value):
+    """Accept a VK community URL, club/public identifier, or numeric ID."""
+    value = str(value).strip()
+    match = re.search(r"(?:club|public)(\\d+)", value, re.IGNORECASE)
+    if match:
+        return int(match.group(1))
+    if value.isdigit():
+        return int(value)
+    return None
+
+
 async def fetch_vk_items(client, group_id, access_token):
     """Read recent original posts from a public VK community."""
     try:
@@ -242,12 +253,19 @@ async def check_once(options, state, client):
         state[key] = list(known_set)[:MAX_SEEN]
 
     vk_token = options.get("vk_service_token", "").strip()
-    for group_id in options.get("vk_group_ids", []) if vk_token else []:
-        try:
-            group_id = int(group_id)
-        except (TypeError, ValueError):
-            LOG.warning("Ignoring invalid VK group ID: %s", group_id)
+    vk_sources = [
+        *options.get("vk_group_ids", []),  # legacy numeric format
+        *options.get("vk_group_urls", []),
+    ]
+    processed_vk_groups = set()
+    for value in vk_sources if vk_token else []:
+        group_id = vk_group_id(value)
+        if not group_id:
+            LOG.warning("Ignoring invalid VK community: %s", value)
             continue
+        if group_id in processed_vk_groups:
+            continue
+        processed_vk_groups.add(group_id)
         items = await fetch_vk_items(client, group_id, vk_token)
         if not items:
             continue

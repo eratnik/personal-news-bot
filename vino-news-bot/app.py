@@ -99,13 +99,38 @@ def parse_html(body, source):
 
 
 def vk_group_id(value):
-    """Accept a VK community URL, club/public identifier, or numeric ID."""
+    """Extract a numeric ID from a VK club/public URL or identifier."""
     value = str(value).strip()
-    match = re.search(r"(?:club|public)(\\d+)", value, re.IGNORECASE)
+    match = re.search(r"(?:club|public)(\d+)", value, re.IGNORECASE)
     if match:
         return int(match.group(1))
     if value.isdigit():
         return int(value)
+    return None
+
+
+async def resolve_vk_group_id(client, value, access_token):
+    """Resolve a short VK community address, such as vk.com/mastersland."""
+    group_id = vk_group_id(value)
+    if group_id:
+        return group_id
+
+    raw = str(value).strip()
+    parsed = urlparse(raw if "://" in raw else f"https://vk.com/{raw}")
+    screen_name = parsed.path.strip("/").split("/")[0]
+    if not screen_name:
+        return None
+    try:
+        response = await client.get(
+            "https://api.vk.com/method/utils.resolveScreenName",
+            params={"screen_name": screen_name, "access_token": access_token, "v": "5.199"},
+        )
+        response.raise_for_status()
+        result = response.json().get("response", {})
+        if result.get("object_type") in {"group", "page"} and result.get("object_id"):
+            return int(result["object_id"])
+    except (httpx.HTTPError, ValueError) as error:
+        LOG.warning("VK community %s: could not resolve address: %s", value, error)
     return None
 
 
@@ -259,9 +284,9 @@ async def check_once(options, state, client):
     ]
     processed_vk_groups = set()
     for value in vk_sources if vk_token else []:
-        group_id = vk_group_id(value)
+        group_id = await resolve_vk_group_id(client, value, vk_token)
         if not group_id:
-            LOG.warning("Ignoring invalid VK community: %s", value)
+            LOG.warning("Ignoring invalid or inaccessible VK community: %s", value)
             continue
         if group_id in processed_vk_groups:
             continue

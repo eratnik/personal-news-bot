@@ -134,6 +134,33 @@ async def resolve_vk_group_id(client, value, access_token):
     return None
 
 
+async def fetch_vk_group_name(client, group_id, access_token):
+    try:
+        response = await client.get(
+            "https://api.vk.com/method/groups.getById",
+            params={"group_id": group_id, "access_token": access_token, "v": "5.199"},
+        )
+        response.raise_for_status()
+        groups = response.json().get("response", [])
+        if groups and groups[0].get("name"):
+            return groups[0]["name"]
+    except (httpx.HTTPError, ValueError):
+        pass
+    return f"VK · {group_id}"
+
+
+def vk_photo_url(post):
+    for attachment in post.get("attachments", []):
+        if attachment.get("type") != "photo":
+            continue
+        sizes = attachment.get("photo", {}).get("sizes", [])
+        if sizes:
+            best = max(sizes, key=lambda size: size.get("width", 0) * size.get("height", 0))
+            if best.get("url"):
+                return best["url"]
+    return None
+
+
 async def fetch_vk_items(client, group_id, access_token):
     """Read recent original posts from a public VK community."""
     try:
@@ -162,11 +189,11 @@ async def fetch_vk_items(client, group_id, access_token):
         if post.get("is_pinned") or not post.get("id"):
             continue
         text = clean_text(post.get("text", ""))
-        title = text[:120] if text else "Новая запись VK"
         items.append({
             "url": f"https://vk.com/wall-{group_id}_{post['id']}",
-            "title": title,
-            "summary": text[:700],
+            "title": text[:120] if text else "Новая запись VK",
+            "summary": text[:850],
+            "photo_url": vk_photo_url(post),
         })
     return items
 
@@ -223,6 +250,37 @@ async def send_message(client, token, chat_id, item, source):
     response = await client.post(
         f"https://api.telegram.org/bot{token}/sendMessage",
         json={"chat_id": chat_id, "text": text[:4000], "parse_mode": "HTML", "disable_web_page_preview": False},
+    )
+    response.raise_for_status()
+
+
+async def send_vk_message(client, token, chat_id, item, group_name):
+    """Send a VK post with its community name, photo, and a clean source link."""
+    source = html.escape(group_name)
+    summary = html.escape(item.get("summary") or "Новая запись VK")
+    link = html.escape(item["url"], quote=True)
+    text = f"<b>{source}</b>\n\n{summary}\n\n<a href=\"{link}\">Подробнее</a>"
+
+    photo_url = item.get("photo_url")
+    if photo_url:
+        try:
+            response = await client.post(
+                f"https://api.telegram.org/bot{token}/sendPhoto",
+                json={
+                    "chat_id": chat_id,
+                    "photo": photo_url,
+                    "caption": text[:1024],
+                    "parse_mode": "HTML",
+                },
+            )
+            response.raise_for_status()
+            return
+        except httpx.HTTPError as error:
+            LOG.warning("Could not attach VK image; sending text instead: %s", error)
+
+    response = await client.post(
+        f"https://api.telegram.org/bot{token}/sendMessage",
+        json={"chat_id": chat_id, "text": text[:4000], "parse_mode": "HTML", "disable_web_page_preview": True},
     )
     response.raise_for_status()
 
@@ -291,11 +349,11 @@ async def check_once(options, state, client):
         if group_id in processed_vk_groups:
             continue
         processed_vk_groups.add(group_id)
+        group_name = await fetch_vk_group_name(client, group_id, vk_token)
         items = await fetch_vk_items(client, group_id, vk_token)
         if not items:
             continue
         key = f"vk:{group_id}"
-        source = f"https://vk.com/club{group_id}"
         known = state.setdefault(key, [])
         known_set = set(known)
         fresh = [item for item in items if item["url"] not in known_set]
@@ -306,7 +364,7 @@ async def check_once(options, state, client):
             delivered = True
             for chat_id in recipients:
                 try:
-                    await send_message(client, token, chat_id, item, source)
+                    await send_vk_message(client, token, chat_id, item, group_name)
                 except httpx.HTTPError as error:
                     LOG.error("Could not send VK post to %s: %s", chat_id, error)
                     delivered = False

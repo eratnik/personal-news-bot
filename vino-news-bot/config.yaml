@@ -1,7 +1,7 @@
 name: Vino News Bot
 slug: vino_news_bot
 description: Delivers new posts from RSS feeds and article pages to a private Telegram bot.
-version: "0.4.0"
+version: "0.5.0"
 url: "https://github.com/eratnik/personal-news-bot"
 arch:
   - amd64

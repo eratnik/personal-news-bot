@@ -142,9 +142,12 @@ async def fetch_vk_group_name(client, group_id, access_token):
         )
         response.raise_for_status()
         groups = response.json().get("response", [])
-        if groups and groups[0].get("name"):
+        # VK API returns either a list (older format) or {"groups": [...]}.
+        if isinstance(groups, dict):
+            groups = groups.get("groups", [])
+        if isinstance(groups, list) and groups and isinstance(groups[0], dict) and groups[0].get("name"):
             return groups[0]["name"]
-    except (httpx.HTTPError, ValueError):
+    except (httpx.HTTPError, ValueError, TypeError, KeyError):
         pass
     return f"VK · {group_id}"
 

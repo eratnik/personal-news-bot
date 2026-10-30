@@ -240,13 +240,56 @@ async def fetch_items(client, source):
     return []
 
 
+async def fetch_article_photo(client, item):
+    """Find the primary image of an article using standard page metadata."""
+    try:
+        response = await client.get(item["url"])
+        response.raise_for_status()
+    except httpx.HTTPError as error:
+        LOG.debug("Could not retrieve article image from %s: %s", item["url"], error)
+        return None
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    for selector in (
+        'meta[property="og:image"]',
+        'meta[name="twitter:image"]',
+        'meta[property="twitter:image"]',
+    ):
+        tag = soup.select_one(selector)
+        if tag and tag.get("content"):
+            return urljoin(item["url"], tag["content"])
+
+    article_image = soup.select_one("article img[src], main img[src], .entry-content img[src]")
+    if article_image and article_image.get("src"):
+        return urljoin(item["url"], article_image["src"])
+    return None
+
+
 async def send_message(client, token, chat_id, item, source):
     title = html.escape(item["title"])
     summary = html.escape(item.get("summary", ""))[:700]
     host = html.escape(urlparse(source).netloc)
-    text = f"<b>{host}</b>\n<a href=\"{item['url']}\">{title}</a>"
+    link = html.escape(item["url"], quote=True)
+    text = f"<b>{host}</b>\n<a href=\"{link}\">{title}</a>"
     if summary:
         text += f"\n\n{summary}"
+
+    if item.get("photo_url"):
+        try:
+            response = await client.post(
+                f"https://api.telegram.org/bot{token}/sendPhoto",
+                json={
+                    "chat_id": chat_id,
+                    "photo": item["photo_url"],
+                    "caption": text[:1024],
+                    "parse_mode": "HTML",
+                },
+            )
+            response.raise_for_status()
+            return
+        except httpx.HTTPError as error:
+            LOG.warning("Could not attach article image; sending text instead: %s", error)
+
     response = await client.post(
         f"https://api.telegram.org/bot{token}/sendMessage",
         json={"chat_id": chat_id, "text": text[:4000], "parse_mode": "HTML", "disable_web_page_preview": False},
@@ -322,6 +365,8 @@ async def check_once(options, state, client):
         if not known and not options.get("send_existing_on_first_run", False):
             LOG.info("%s: first scan complete; %s existing posts saved without delivery", source, len(items))
             fresh = []
+        for item in fresh:
+            item["photo_url"] = await fetch_article_photo(client, item)
         for item in reversed(fresh):
             delivered = True
             for chat_id in recipients:

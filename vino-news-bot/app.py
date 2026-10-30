@@ -98,6 +98,43 @@ def parse_html(body, source):
     return found[:50]
 
 
+async def fetch_vk_items(client, group_id, access_token):
+    """Read recent original posts from a public VK community."""
+    try:
+        response = await client.get(
+            "https://api.vk.com/method/wall.get",
+            params={
+                "owner_id": f"-{group_id}",
+                "count": 20,
+                "filter": "owner",
+                "access_token": access_token,
+                "v": "5.199",
+            },
+        )
+        response.raise_for_status()
+        payload = response.json()
+    except (httpx.HTTPError, ValueError) as error:
+        LOG.warning("VK group %s: request failed: %s", group_id, error)
+        return []
+
+    if payload.get("error"):
+        LOG.warning("VK group %s: API error: %s", group_id, payload["error"].get("error_msg", "unknown error"))
+        return []
+
+    items = []
+    for post in payload.get("response", {}).get("items", []):
+        if post.get("is_pinned") or not post.get("id"):
+            continue
+        text = clean_text(post.get("text", ""))
+        title = text[:120] if text else "Новая запись VK"
+        items.append({
+            "url": f"https://vk.com/wall-{group_id}_{post['id']}",
+            "title": title,
+            "summary": text[:700],
+        })
+    return items
+
+
 async def fetch_items(client, source):
     for candidate in feed_candidates(source):
         try:
@@ -198,6 +235,37 @@ async def check_once(options, state, client):
                     await send_message(client, token, chat_id, item, source)
                 except httpx.HTTPError as error:
                     LOG.error("Could not send '%s' to %s: %s", item["title"], chat_id, error)
+                    delivered = False
+                    break
+            if delivered:
+                known_set.add(item["url"])
+        state[key] = list(known_set)[:MAX_SEEN]
+
+    vk_token = options.get("vk_service_token", "").strip()
+    for group_id in options.get("vk_group_ids", []) if vk_token else []:
+        try:
+            group_id = int(group_id)
+        except (TypeError, ValueError):
+            LOG.warning("Ignoring invalid VK group ID: %s", group_id)
+            continue
+        items = await fetch_vk_items(client, group_id, vk_token)
+        if not items:
+            continue
+        key = f"vk:{group_id}"
+        source = f"https://vk.com/club{group_id}"
+        known = state.setdefault(key, [])
+        known_set = set(known)
+        fresh = [item for item in items if item["url"] not in known_set]
+        if not known and not options.get("send_existing_on_first_run", False):
+            LOG.info("VK group %s: first scan complete; %s existing posts saved without delivery", group_id, len(items))
+            fresh = []
+        for item in reversed(fresh):
+            delivered = True
+            for chat_id in recipients:
+                try:
+                    await send_message(client, token, chat_id, item, source)
+                except httpx.HTTPError as error:
+                    LOG.error("Could not send VK post to %s: %s", chat_id, error)
                     delivered = False
                     break
             if delivered:

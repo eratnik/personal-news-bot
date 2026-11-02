@@ -152,16 +152,43 @@ async def fetch_vk_group_name(client, group_id, access_token):
     return f"VK · {group_id}"
 
 
-def vk_photo_url(post):
+def vk_best_image_url(images):
+    if not images:
+        return None
+    best = max(images, key=lambda image: image.get("width", 0) * image.get("height", 0))
+    return best.get("url")
+
+
+def vk_media(post):
+    """Collect VK media that Telegram can accept as remote URLs."""
+    photos, seen = [], set()
+    video_url = None
+    video_preview_url = None
+    has_video = False
+
     for attachment in post.get("attachments", []):
-        if attachment.get("type") != "photo":
-            continue
-        sizes = attachment.get("photo", {}).get("sizes", [])
-        if sizes:
-            best = max(sizes, key=lambda size: size.get("width", 0) * size.get("height", 0))
-            if best.get("url"):
-                return best["url"]
-    return None
+        kind = attachment.get("type")
+        if kind == "photo":
+            photo_url = vk_best_image_url(attachment.get("photo", {}).get("sizes", []))
+            if photo_url and photo_url not in seen:
+                photos.append(photo_url)
+                seen.add(photo_url)
+        elif kind == "video":
+            has_video = True
+            video = attachment.get("video", {})
+            # VK rarely exposes a direct MP4 URL. Use it when it is available;
+            # otherwise Telegram receives the video's cover with a link to VK.
+            for key, value in (video.get("files") or {}).items():
+                if key.startswith("mp4_") and isinstance(value, str) and value.startswith(("http://", "https://")):
+                    video_url = video_url or value
+            video_preview_url = video_preview_url or vk_best_image_url(video.get("image", []))
+
+    return {
+        "photo_urls": photos[:10],
+        "video_url": video_url,
+        "video_preview_url": video_preview_url,
+        "has_video": has_video,
+    }
 
 
 async def fetch_vk_items(client, group_id, access_token):
@@ -196,7 +223,7 @@ async def fetch_vk_items(client, group_id, access_token):
             "url": f"https://vk.com/wall-{group_id}_{post['id']}",
             "title": text[:120] if text else "Новая запись VK",
             "summary": text[:850],
-            "photo_url": vk_photo_url(post),
+            **vk_media(post),
         })
     return items
 
@@ -301,31 +328,50 @@ async def send_message(client, token, chat_id, item, source):
 
 
 async def send_vk_message(client, token, chat_id, item, group_name):
-    """Send a VK post with its community name, photo, and a clean source link."""
+    """Send a VK post with its community name and the best available media."""
     source = html.escape(group_name)
     summary = html.escape(item.get("summary") or "Новая запись VK")
     link = html.escape(item["url"], quote=True)
-    text = f"<b>{source}</b>\n\n{summary}\n\n<a href=\"{link}\">Подробнее</a>"
+    video_note = "\n\n🎬 В публикации есть видео." if item.get("has_video") else ""
+    text = f"<b>{source}</b>\n\n{summary}{video_note}\n\n<a href=\"{link}\">Подробнее</a>"
+    caption = text[:1024]
+    api = f"https://api.telegram.org/bot{token}"
 
-    photo_url = item.get("photo_url")
-    if photo_url:
-        try:
+    photo_urls = item.get("photo_urls", [])
+    try:
+        if len(photo_urls) >= 2:
+            media = [{"type": "photo", "media": photo_url} for photo_url in photo_urls]
+            media[0]["caption"] = caption
+            media[0]["parse_mode"] = "HTML"
+            response = await client.post(f"{api}/sendMediaGroup", json={"chat_id": chat_id, "media": media})
+            response.raise_for_status()
+            return
+        if len(photo_urls) == 1:
             response = await client.post(
-                f"https://api.telegram.org/bot{token}/sendPhoto",
-                json={
-                    "chat_id": chat_id,
-                    "photo": photo_url,
-                    "caption": text[:1024],
-                    "parse_mode": "HTML",
-                },
+                f"{api}/sendPhoto",
+                json={"chat_id": chat_id, "photo": photo_urls[0], "caption": caption, "parse_mode": "HTML"},
             )
             response.raise_for_status()
             return
-        except httpx.HTTPError as error:
-            LOG.warning("Could not attach VK image; sending text instead: %s", error)
+        if item.get("video_url"):
+            response = await client.post(
+                f"{api}/sendVideo",
+                json={"chat_id": chat_id, "video": item["video_url"], "caption": caption, "parse_mode": "HTML"},
+            )
+            response.raise_for_status()
+            return
+        if item.get("video_preview_url"):
+            response = await client.post(
+                f"{api}/sendPhoto",
+                json={"chat_id": chat_id, "photo": item["video_preview_url"], "caption": caption, "parse_mode": "HTML"},
+            )
+            response.raise_for_status()
+            return
+    except httpx.HTTPError as error:
+        LOG.warning("Could not attach VK media; sending text instead: %s", error)
 
     response = await client.post(
-        f"https://api.telegram.org/bot{token}/sendMessage",
+        f"{api}/sendMessage",
         json={"chat_id": chat_id, "text": text[:4000], "parse_mode": "HTML", "disable_web_page_preview": True},
     )
     response.raise_for_status()

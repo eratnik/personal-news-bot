@@ -1,0 +1,28 @@
+name: Telegram Transcriber
+version: "1.0.2"
+slug: telegram_transcriber
+description: "Локальная расшифровка голосовых Telegram через Whisper"
+url: https://github.com/eratnik/personal-news-bot
+arch:
+  - amd64
+  - aarch64
+startup: application
+boot: auto
+init: false
+options:
+  bot_token: ""
+  allowed_user_ids: []
+  whisper_host: core-whisper
+  whisper_port: 10300
+  language: ru
+  max_duration_seconds: 300
+  transcription_timeout: 300
+schema:
+  bot_token: password
+  allowed_user_ids:
+    - int
+  whisper_host: str
+  whisper_port: port
+  language: str
+  max_duration_seconds: int(1,600)
+  transcription_timeout: int(30,900)

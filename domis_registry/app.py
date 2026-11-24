@@ -1,4 +1,6 @@
+import json
 import logging
+import re
 import secrets
 import ssl
 from html import escape
@@ -14,6 +16,14 @@ URL = "https://danger.gskp.by/products-registry"
 INGRESS_IP = "172.30.32.2"
 SNAPSHOT = Path("/data/registry-response.html")
 EXPORT = Path("/data/registry-export.csv")
+FILTERS = Path("/data/registry-filters.json")
+DEFAULT_FILTERS = {
+    "name": [
+        "холодильник", "морозильник", "стиральная машина", "посудомоечная машина",
+        "пылесос", "кондиционер", "варочная панель", "микроволновая печь",
+    ],
+    "tnved": [],
+}
 TOKEN = secrets.token_urlsafe()
 MAX_BYTES = 5 * 1024 * 1024
 
@@ -37,7 +47,7 @@ def registry_tls_context():
 
 
 def fetch_registry(url):
-    request = Request(url, headers={"User-Agent": "DomisRegistry/0.2.0"})
+    request = Request(url, headers={"User-Agent": "DomisRegistry/0.3.0"})
     opener = build_opener(RegistryRedirect(), HTTPSHandler(context=registry_tls_context()))
     with opener.open(request, timeout=12) as response:
         content_type = response.headers.get_content_type()
@@ -55,6 +65,26 @@ def save_file(path, data):
     temporary.replace(path)
 
 
+def read_filters():
+    if FILTERS.exists():
+        return json.loads(FILTERS.read_text(encoding="utf-8"))
+    return DEFAULT_FILTERS
+
+
+def save_filters(fields):
+    filters = {}
+    for field in DEFAULT_FILTERS:
+        lines = fields.get(field, [""])[0].splitlines()
+        values = list(dict.fromkeys(line.strip() for line in lines if line.strip()))
+        if len(values) > 30 or any(len(value) > 100 for value in values):
+            raise ValueError("Можно сохранить до 30 значений каждого вида, до 100 символов на строку")
+        if field == "tnved" and any(not re.fullmatch(r"[0-9]{4,10}", value) for value in values):
+            raise ValueError("Каждый код ТН ВЭД должен содержать от 4 до 10 цифр")
+        filters[field] = values
+    save_file(FILTERS, json.dumps(filters, ensure_ascii=False).encode("utf-8"))
+    return f"Сохранено ключевых слов: {len(filters['name'])}. Кодов ТН ВЭД: {len(filters['tnved'])}."
+
+
 def probe():
     status, body = fetch_registry(URL)
     save_file(SNAPSHOT, body)
@@ -64,7 +94,7 @@ def probe():
 def export_registry(field, value):
     rows, total = collect(lambda url: fetch_registry(url)[1].decode("utf-8"), URL, field, value)
     save_file(EXPORT, csv_bytes(rows))
-    summary = f"Выгружено {len(rows)} из {total} записей."
+    summary = f"Фильтр «{value}». Выгружено {len(rows)} из {total} записей."
     if len(rows) < total:
         summary += " В CSV сохранены первые две страницы."
     return summary
@@ -86,6 +116,20 @@ class Handler(BaseHTTPRequestHandler):
         result = f'<p role="status">{escape(status_message)}</p>' if status_message else ""
         download = '<p><a href="./snapshot">Скачать последний ответ HTML</a></p>' if SNAPSHOT.exists() else ""
         csv_download = '<p><a href="./csv">Скачать CSV последней успешной выгрузки</a></p>' if EXPORT.exists() else ""
+        filters = read_filters()
+        options = "".join(
+            f'<option value="{escape(field + ":" + value)}">{escape(label + " · " + value)}</option>'
+            for field, label in (("name", "Наименование"), ("tnved", "ТН ВЭД"))
+            for value in filters[field]
+        )
+        saved_control = f"""
+<form method="post" action="./export">
+  <input type="hidden" name="token" value="{TOKEN}">
+  <label>Сохранённый фильтр <select name="preset">{options}</select></label>
+  <button>Выгрузить CSV</button>
+</form>""" if options else ""
+        names = escape("\n".join(filters["name"]))
+        codes = escape("\n".join(filters["tnved"]))
         page = f"""<!doctype html>
 <html lang="ru">
 <meta charset="utf-8">
@@ -94,10 +138,15 @@ class Handler(BaseHTTPRequestHandler):
 <style>
 body {{ font: 1.05rem system-ui, sans-serif; margin: 3rem auto; max-width: 42rem; padding: 0 1rem; }}
 button {{ font: inherit; padding: .6rem 1rem; cursor: pointer; }}
+form {{ margin: 1rem 0; }}
+textarea {{ display: block; width: 100%; box-sizing: border-box; margin: .4rem 0 .8rem; }}
 </style>
 <main>
 <h1>Реестр опасной продукции</h1>
 <p>Пробная выгрузка сохраняет до двух страниц по одному фильтру.</p>
+{saved_control}
+<details>
+<summary>Разовый поиск</summary>
 <form method="post" action="./export">
   <input type="hidden" name="token" value="{TOKEN}">
   <label>Фильтр
@@ -109,8 +158,19 @@ button {{ font: inherit; padding: .6rem 1rem; cursor: pointer; }}
   <label>Значение <input name="value" required maxlength="100"></label>
   <button>Выгрузить CSV</button>
 </form>
+</details>
 {result}
 {csv_download}
+<details>
+<summary>Настройка сохранённых фильтров</summary>
+<p>Введите по одному ключевому слову, фразе или коду на строку.</p>
+<form method="post" action="./filters">
+  <input type="hidden" name="token" value="{TOKEN}">
+  <label>Ключевые слова<textarea name="name" rows="8" maxlength="3030">{names}</textarea></label>
+  <label>Коды ТН ВЭД<textarea name="tnved" rows="4" maxlength="330">{codes}</textarea></label>
+  <button>Сохранить фильтры</button>
+</form>
+</details>
 <hr>
 <form method="post" action="./probe">
   <input type="hidden" name="token" value="{TOKEN}">
@@ -135,11 +195,11 @@ button {{ font: inherit; padding: .6rem 1rem; cursor: pointer; }}
     def do_POST(self):
         if self.client_address[0] != INGRESS_IP:
             return self.send_error(403)
-        if self.path not in ("/probe", "/export"):
+        if self.path not in ("/probe", "/export", "/filters"):
             return self.send_error(404)
         try:
             length = int(self.headers.get("Content-Length", "0"))
-            if not 0 < length <= 4096:
+            if not 0 < length <= 65536:
                 raise ValueError("Invalid request size")
             fields = parse_qs(self.rfile.read(length).decode("ascii"))
         except ValueError:
@@ -148,13 +208,20 @@ button {{ font: inherit; padding: .6rem 1rem; cursor: pointer; }}
             return self.send_error(403)
         try:
             if self.path == "/export":
-                field = fields.get("field", [""])[0]
-                value = fields.get("value", [""])[0].strip()
+                if "preset" in fields:
+                    field, _, value = fields["preset"][0].partition(":")
+                    if value not in read_filters().get(field, []):
+                        raise ValueError("Сохранённый фильтр не найден")
+                else:
+                    field = fields.get("field", [""])[0]
+                    value = fields.get("value", [""])[0].strip()
                 result = export_registry(field, value)
+            elif self.path == "/filters":
+                result = save_filters(fields)
             else:
                 result = probe()
         except (OSError, ValueError) as error:
-            result = f"Ошибка при получении страницы: {error}"
+            result = f"Ошибка: {error}"
         logging.info("%s", result)
         self.show_page(result)
 

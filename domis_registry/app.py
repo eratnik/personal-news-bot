@@ -1,11 +1,12 @@
 import logging
 import secrets
+import ssl
 from html import escape
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from urllib.error import HTTPError
 from urllib.parse import parse_qs, urlsplit
-from urllib.request import HTTPRedirectHandler, Request, build_opener
+from urllib.request import HTTPRedirectHandler, HTTPSHandler, Request, build_opener
 
 URL = "https://danger.gskp.by/products-registry"
 INGRESS_IP = "172.30.32.2"
@@ -22,9 +23,20 @@ class RegistryRedirect(HTTPRedirectHandler):
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
+def registry_tls_context():
+    context = ssl.create_default_context()
+    # Require the chain to reach a trusted root, even with the issuer supplied here.
+    context.verify_flags &= ~ssl.VERIFY_X509_PARTIAL_CHAIN
+    context.load_verify_locations(
+        cafile=Path(__file__).with_name("globalsign-r6-alphassl-2025.pem")
+    )
+    return context
+
+
 def probe():
-    request = Request(URL, headers={"User-Agent": "DomisRegistry/0.1"})
-    with build_opener(RegistryRedirect()).open(request, timeout=12) as response:
+    request = Request(URL, headers={"User-Agent": "DomisRegistry/0.1.1"})
+    opener = build_opener(RegistryRedirect(), HTTPSHandler(context=registry_tls_context()))
+    with opener.open(request, timeout=12) as response:
         content_type = response.headers.get_content_type()
         body = response.read(MAX_BYTES + 1)
         if content_type != "text/html" or not body.strip() or len(body) > MAX_BYTES:

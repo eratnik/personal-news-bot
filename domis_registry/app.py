@@ -56,7 +56,7 @@ def registry_tls_context():
 
 
 def fetch_registry(url):
-    request = Request(url, headers={"User-Agent": "DomisRegistry/0.5.0"})
+    request = Request(url, headers={"User-Agent": "DomisRegistry/0.5.1"})
     opener = build_opener(SameHostRedirect(), HTTPSHandler(context=registry_tls_context()))
     with opener.open(request, timeout=12) as response:
         content_type = response.headers.get_content_type()
@@ -134,7 +134,7 @@ def export_registry(field, value):
 
 
 def compare_with_catalog():
-    request = Request(CATALOG_URL, headers={"User-Agent": "DomisRegistry/0.5.0"})
+    request = Request(CATALOG_URL, headers={"User-Agent": "DomisRegistry/0.5.1"})
     with build_opener(SameHostRedirect()).open(request, timeout=20) as response:
         payload = response.read(MAX_BYTES + 1)
         if len(payload) > MAX_BYTES:
@@ -201,7 +201,7 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(content)
 
-    def show_page(self, status_message=""):
+    def show_page(self, status_message="", action=""):
         result = f'<p role="status">{escape(status_message)}</p>' if status_message else ""
         download = '<p><a href="./snapshot">Скачать последний ответ HTML</a></p>' if SNAPSHOT.exists() else ""
         csv_download = '<p><a href="./csv">Скачать CSV последней успешной выгрузки</a></p>' if EXPORT.exists() else ""
@@ -240,13 +240,31 @@ class Handler(BaseHTTPRequestHandler):
 {refresh}
 <title>Domis Registry</title>
 <style>
-body {{ font: 1.05rem system-ui, sans-serif; margin: 3rem auto; max-width: 42rem; padding: 0 1rem; }}
-button {{ font: inherit; padding: .6rem 1rem; cursor: pointer; }}
-form {{ margin: 1rem 0; }}
-textarea {{ display: block; width: 100%; box-sizing: border-box; margin: .4rem 0 .8rem; }}
+:root {{ color-scheme: light dark; }}
+body {{ font: 1rem/1.5 system-ui, sans-serif; margin: 0; }}
+main {{ max-width: 84rem; margin: auto; padding: clamp(1rem, 3vw, 2.5rem); }}
+h1 {{ margin: 0 0 1.4rem; line-height: 1.15; font-size: clamp(1.65rem, 4vw, 2.25rem); }}
+h2 {{ margin: 0 0 .8rem; font-size: 1.18rem; }}
+.blocks {{ display: grid; grid-template-columns: minmax(0, 1fr); gap: 1rem; align-items: start; }}
+.block {{
+  min-width: 0; padding: 1rem; border: 1px solid color-mix(in srgb, CanvasText 22%, Canvas);
+  border-radius: .65rem; overflow-wrap: anywhere;
+}}
+@media (min-width: 44rem) {{ .blocks {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }} }}
+@media (min-width: 68rem) {{ .blocks {{ grid-template-columns: 1fr 1.2fr .8fr; }} }}
+button, select, input, textarea {{ font: inherit; max-width: 100%; box-sizing: border-box; }}
+button {{ padding: .5rem .8rem; cursor: pointer; text-align: left; }}
+form, details, p {{ margin: .75rem 0; }}
+summary {{ cursor: pointer; }}
+label {{ display: block; margin-bottom: .65rem; }}
+select, input:not([type="hidden"]), textarea {{ display: block; width: 100%; margin-top: .25rem; }}
+.block > :last-child {{ margin-bottom: 0; }}
 </style>
 <main>
 <h1>Реестр опасной продукции</h1>
+<div class="blocks">
+<section class="block" aria-labelledby="batch-heading">
+<h2 id="batch-heading">Общая выгрузка и сверка</h2>
 <form method="post" action="./batch">
   <input type="hidden" name="token" value="{TOKEN}">
   <button{batch_disabled}>Выгрузить все фильтры</button>
@@ -256,10 +274,13 @@ textarea {{ display: block; width: 100%; box-sizing: border-box; margin: .4rem 0
   <button{batch_disabled}>Сверить последний общий CSV с domis.by</button>
 </form>
 {batch_result}
+{result if action in ("/batch", "/compare") else ""}
 <p><a href="./">Обновить статус</a></p>
 {match_download}
 {batch_download}
-<hr>
+</section>
+<section class="block" aria-labelledby="search-heading">
+<h2 id="search-heading">Поиск по фильтру</h2>
 <p>Выгрузка по одному фильтру сохраняет до двух страниц.</p>
 {saved_control}
 <details>
@@ -276,9 +297,8 @@ textarea {{ display: block; width: 100%; box-sizing: border-box; margin: .4rem 0
   <button>Выгрузить CSV</button>
 </form>
 </details>
-{result}
+{result if action in ("/export", "/filters") else ""}
 {csv_download}
-{diagnostic_download}
 <details>
 <summary>Настройка сохранённых фильтров</summary>
 <p>Введите по одному ключевому слову, фразе или коду на строку.</p>
@@ -289,12 +309,18 @@ textarea {{ display: block; width: 100%; box-sizing: border-box; margin: .4rem 0
   <button>Сохранить фильтры</button>
 </form>
 </details>
-<hr>
+</section>
+<section class="block" aria-labelledby="diagnostics-heading">
+<h2 id="diagnostics-heading">Диагностика</h2>
 <form method="post" action="./probe">
   <input type="hidden" name="token" value="{TOKEN}">
   <button>Проверить соединение</button>
 </form>
+{result if action == "/probe" else ""}
+{diagnostic_download}
 {download}
+</section>
+</div>
 </main>
 </html>"""
         self.send_content(200, page.encode(), "text/html; charset=utf-8")
@@ -356,7 +382,7 @@ textarea {{ display: block; width: 100%; box-sizing: border-box; margin: .4rem 0
             result = f"Ошибка: {error}"
         if result:
             logging.info("%s", result)
-        self.show_page(result)
+        self.show_page(result, self.path)
 
 
 if __name__ == "__main__":

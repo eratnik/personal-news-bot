@@ -1,0 +1,114 @@
+import csv
+import io
+import re
+from html.parser import HTMLParser
+from urllib.parse import urlencode
+
+
+FIELDS = (
+    "title", "prescription", "issueDate", "effectDate", "tnved", "trts",
+    "pd_number", "manufacturer", "measure", "importers", "suppliers", "violation",
+)
+FIELDS_IN_RUSSIAN = (
+    "Запись реестра", "Предписание", "Дата выдачи", "Дата введения меры",
+    "ТН ВЭД", "ТР ТС", "Документ соответствия", "Производитель", "Мера",
+    "Импортёры", "Поставщики", "Нарушения",
+)
+PAGE_LIMIT = 2
+
+
+class RegistryPage(HTMLParser):
+    def __init__(self, html):
+        super().__init__()
+        self.rows = []
+        self.filters = {}
+        self.page_info = ""
+        self.card = None
+        self.field = None
+        self.info = False
+        self.grid_seen = False
+        self.feed(html)
+        self.close()
+
+    def handle_starttag(self, tag, attributes):
+        attrs = dict(attributes)
+        classes = (attrs.get("class") or "").split()
+        if tag == "input" and attrs.get("id") in ("searchProduct", "searchTnved"):
+            self.filters[attrs["name"]] = attrs.get("value") or ""
+        if tag == "div" and attrs.get("id") == "cardsGrid":
+            self.grid_seen = True
+        if tag == "div" and attrs.get("id") == "pageInfo":
+            self.info = True
+            self.page_info = ""
+        if tag == "article" and "rc" in classes:
+            self.card = {"title": attrs.get("aria-label") or ""}
+        if tag == "dd" and self.card is not None:
+            self.field = next(
+                (name for name in FIELDS[1:] if f"rc-field-value--{name}" in classes), None
+            )
+            if self.field:
+                self.card[self.field] = ""
+
+    def handle_data(self, data):
+        if self.info:
+            self.page_info += data
+        if self.field:
+            self.card[self.field] += data
+
+    def handle_endtag(self, tag):
+        if tag == "dd":
+            self.field = None
+        if tag == "div":
+            self.info = False
+        if tag == "article" and self.card is not None:
+            self.rows.append({key: " ".join(value.split()) for key, value in self.card.items()})
+            self.card = None
+
+
+def collect(fetch, registry_url, field, value):
+    if field not in ("name", "tnved") or not 1 <= len(value) <= 100:
+        raise ValueError("Укажите наименование или код ТН ВЭД длиной до 100 символов")
+    if field == "tnved" and not re.fullmatch(r"[0-9]{4,10}", value):
+        raise ValueError("Код ТН ВЭД должен содержать от 4 до 10 цифр")
+    rows = {}
+    expected_start = 1
+    total = None
+    for number in range(1, PAGE_LIMIT + 1):
+        query = urlencode({field: value, "page": number, "per_page": 10})
+        page_url = f"{registry_url}?{query}"
+        page = RegistryPage(fetch(page_url))
+        info = " ".join(page.page_info.split())
+        if not page.grid_seen or page.filters.get(field) != value:
+            raise ValueError("Фильтр или структура выдачи не подтверждены")
+        match = re.fullmatch(r"Показано ([0-9]+) [–-] ([0-9]+) из ([0-9]+)", info)
+        if not match:
+            raise ValueError("Реестр не вернул проверяемый диапазон записей")
+        start, end, page_total = map(int, match.groups())
+        if (start, end, page_total) == (0, 0, 0) and not page.rows and number == 1:
+            return [], 0
+        if (
+            start != expected_start or not start <= end <= page_total
+            or end - start + 1 != len(page.rows) or len(page.rows) > 10
+            or (total is not None and page_total != total)
+        ):
+            raise ValueError("Количество записей или порядок страниц изменились")
+        total = page_total
+        for row in page.rows:
+            record = row["title"].partition(". ")[0]
+            if not record or record in rows or not row.get("measure"):
+                raise ValueError("В выдаче найдена повторная или неполная карточка")
+            rows[record] = {**row, "record": record, "url": f"{registry_url}?{urlencode({'year_number': record})}"}
+        if end == total:
+            break
+        expected_start = end + 1
+    return list(rows.values()), total
+
+
+def csv_bytes(rows):
+    output = io.StringIO(newline="")
+    writer = csv.writer(output, delimiter=";")
+    writer.writerow(("Номер записи", *FIELDS_IN_RUSSIAN, "Ссылка на поиск записи"))
+    for row in rows:
+        values = (row.get(key, "") for key in ("record", *FIELDS, "url"))
+        writer.writerow("'" + value if value.startswith(("=", "+", "-", "@")) and value != "-" else value for value in values)
+    return output.getvalue().encode("utf-8-sig")

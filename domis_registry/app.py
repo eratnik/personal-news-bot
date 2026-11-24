@@ -8,9 +8,12 @@ from urllib.error import HTTPError
 from urllib.parse import parse_qs, urlsplit
 from urllib.request import HTTPRedirectHandler, HTTPSHandler, Request, build_opener
 
+from registry_export import collect, csv_bytes
+
 URL = "https://danger.gskp.by/products-registry"
 INGRESS_IP = "172.30.32.2"
 SNAPSHOT = Path("/data/registry-response.html")
+EXPORT = Path("/data/registry-export.csv")
 TOKEN = secrets.token_urlsafe()
 MAX_BYTES = 5 * 1024 * 1024
 
@@ -33,18 +36,38 @@ def registry_tls_context():
     return context
 
 
-def probe():
-    request = Request(URL, headers={"User-Agent": "DomisRegistry/0.1.1"})
+def fetch_registry(url):
+    request = Request(url, headers={"User-Agent": "DomisRegistry/0.2.0"})
     opener = build_opener(RegistryRedirect(), HTTPSHandler(context=registry_tls_context()))
     with opener.open(request, timeout=12) as response:
         content_type = response.headers.get_content_type()
         body = response.read(MAX_BYTES + 1)
         if content_type != "text/html" or not body.strip() or len(body) > MAX_BYTES:
             raise ValueError(f"Неожиданный ответ: {content_type}, {len(body)} байт")
-        temporary = SNAPSHOT.with_suffix(".tmp")
-        temporary.write_bytes(body)
-        temporary.replace(SNAPSHOT)
-        return f"HTTP {response.status}. Получен HTML, {len(body)} байт."
+        if response.geturl() != url:
+            raise ValueError("Реестр перенаправил запрос на другой адрес")
+        return response.status, body
+
+
+def save_file(path, data):
+    temporary = path.with_suffix(".tmp")
+    temporary.write_bytes(data)
+    temporary.replace(path)
+
+
+def probe():
+    status, body = fetch_registry(URL)
+    save_file(SNAPSHOT, body)
+    return f"HTTP {status}. Получен HTML, {len(body)} байт."
+
+
+def export_registry(field, value):
+    rows, total = collect(lambda url: fetch_registry(url)[1].decode("utf-8"), URL, field, value)
+    save_file(EXPORT, csv_bytes(rows))
+    summary = f"Выгружено {len(rows)} из {total} записей."
+    if len(rows) < total:
+        summary += " В CSV сохранены первые две страницы."
+    return summary
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -62,6 +85,7 @@ class Handler(BaseHTTPRequestHandler):
     def show_page(self, status_message=""):
         result = f'<p role="status">{escape(status_message)}</p>' if status_message else ""
         download = '<p><a href="./snapshot">Скачать последний ответ HTML</a></p>' if SNAPSHOT.exists() else ""
+        csv_download = '<p><a href="./csv">Скачать CSV последней успешной выгрузки</a></p>' if EXPORT.exists() else ""
         page = f"""<!doctype html>
 <html lang="ru">
 <meta charset="utf-8">
@@ -73,12 +97,25 @@ button {{ font: inherit; padding: .6rem 1rem; cursor: pointer; }}
 </style>
 <main>
 <h1>Реестр опасной продукции</h1>
-<p>Проверьте, может ли сервер Home Assistant получить страницу Госстандарта.</p>
+<p>Пробная выгрузка сохраняет до двух страниц по одному фильтру.</p>
+<form method="post" action="./export">
+  <input type="hidden" name="token" value="{TOKEN}">
+  <label>Фильтр
+    <select name="field">
+      <option value="name">Наименование</option>
+      <option value="tnved">Код ТН ВЭД</option>
+    </select>
+  </label>
+  <label>Значение <input name="value" required maxlength="100"></label>
+  <button>Выгрузить CSV</button>
+</form>
+{result}
+{csv_download}
+<hr>
 <form method="post" action="./probe">
   <input type="hidden" name="token" value="{TOKEN}">
   <button>Проверить соединение</button>
 </form>
-{result}
 {download}
 </main>
 </html>"""
@@ -91,16 +128,18 @@ button {{ font: inherit; padding: .6rem 1rem; cursor: pointer; }}
             return self.show_page()
         if self.path == "/snapshot" and SNAPSHOT.exists():
             return self.send_content(200, SNAPSHOT.read_bytes(), "application/octet-stream", SNAPSHOT.name)
+        if self.path == "/csv" and EXPORT.exists():
+            return self.send_content(200, EXPORT.read_bytes(), "text/csv; charset=utf-8", EXPORT.name)
         self.send_error(404)
 
     def do_POST(self):
         if self.client_address[0] != INGRESS_IP:
             return self.send_error(403)
-        if self.path != "/probe":
+        if self.path not in ("/probe", "/export"):
             return self.send_error(404)
         try:
             length = int(self.headers.get("Content-Length", "0"))
-            if not 0 < length <= 256:
+            if not 0 < length <= 4096:
                 raise ValueError("Invalid request size")
             fields = parse_qs(self.rfile.read(length).decode("ascii"))
         except ValueError:
@@ -108,7 +147,12 @@ button {{ font: inherit; padding: .6rem 1rem; cursor: pointer; }}
         if fields.get("token") != [TOKEN]:
             return self.send_error(403)
         try:
-            result = probe()
+            if self.path == "/export":
+                field = fields.get("field", [""])[0]
+                value = fields.get("value", [""])[0].strip()
+                result = export_registry(field, value)
+            else:
+                result = probe()
         except (OSError, ValueError) as error:
             result = f"Ошибка при получении страницы: {error}"
         logging.info("%s", result)

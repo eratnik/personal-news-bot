@@ -48,7 +48,7 @@ def registry_tls_context():
 
 
 def fetch_registry(url):
-    request = Request(url, headers={"User-Agent": "DomisRegistry/0.3.1"})
+    request = Request(url, headers={"User-Agent": "DomisRegistry/0.3.2"})
     opener = build_opener(RegistryRedirect(), HTTPSHandler(context=registry_tls_context()))
     with opener.open(request, timeout=12) as response:
         content_type = response.headers.get_content_type()
@@ -109,6 +109,8 @@ def export_registry(field, value):
             raise ValueError(f"{error}. Ответ для диагностики сохранён") from error
         raise
     save_file(EXPORT, csv_bytes(rows))
+    if total == 0:
+        return f"По фильтру «{value}» реестр не нашёл записей."
     summary = f"Фильтр «{value}». Выгружено {len(rows)} из {total} записей."
     if len(rows) < total:
         summary += " В CSV сохранены первые две страницы."

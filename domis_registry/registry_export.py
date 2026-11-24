@@ -27,6 +27,9 @@ class RegistryPage(HTMLParser):
         self.field = None
         self.info = False
         self.grid_seen = False
+        self.empty_block = False
+        self.empty_paragraph = False
+        self.empty_message = ""
         self.feed(html)
         self.close()
 
@@ -37,6 +40,10 @@ class RegistryPage(HTMLParser):
             self.filters[attrs["name"]] = attrs.get("value") or ""
         if tag == "div" and attrs.get("id") == "cardsGrid":
             self.grid_seen = True
+        if tag == "div" and "cards-empty" in classes:
+            self.empty_block = True
+        if tag == "p" and self.empty_block:
+            self.empty_paragraph = True
         if tag == "div" and attrs.get("id") == "pageInfo":
             self.info = True
             self.page_info = ""
@@ -50,16 +57,21 @@ class RegistryPage(HTMLParser):
                 self.card[self.field] = ""
 
     def handle_data(self, data):
+        if self.empty_paragraph:
+            self.empty_message += data
         if self.info:
             self.page_info += data
         if self.field:
             self.card[self.field] += data
 
     def handle_endtag(self, tag):
+        if tag == "p":
+            self.empty_paragraph = False
         if tag == "dd":
             self.field = None
         if tag == "div":
             self.info = False
+            self.empty_block = False
         if tag == "article" and self.card is not None:
             self.rows.append({key: " ".join(value.split()) for key, value in self.card.items()})
             self.card = None
@@ -80,6 +92,8 @@ def collect(fetch, registry_url, field, value):
         info = " ".join(page.page_info.split())
         if page.filters.get(field) != value:
             raise ValueError(f"Страница {number}. Реестр не подтвердил значение фильтра «{value}»")
+        if number == 1 and not page.rows and " ".join(page.empty_message.split()) == "Записи не найдены":
+            return [], 0
         if not page.grid_seen:
             raise ValueError(f"Страница {number}. В ответе реестра отсутствует блок карточек")
         match = re.fullmatch(r"Показано ([0-9]+) [–-] ([0-9]+) из ([0-9]+)", info)

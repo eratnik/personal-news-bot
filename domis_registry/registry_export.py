@@ -2,6 +2,7 @@ import csv
 import io
 import re
 from html.parser import HTMLParser
+from itertools import count
 from urllib.parse import urlencode
 
 
@@ -77,7 +78,7 @@ class RegistryPage(HTMLParser):
             self.card = None
 
 
-def collect(fetch, registry_url, field, value):
+def collect(fetch, registry_url, field, value, page_limit=PAGE_LIMIT):
     if field not in ("name", "tnved") or not 1 <= len(value) <= 100:
         raise ValueError("Укажите наименование или код ТН ВЭД длиной до 100 символов")
     if field == "tnved" and not re.fullmatch(r"[0-9]{4,10}", value):
@@ -85,7 +86,8 @@ def collect(fetch, registry_url, field, value):
     rows = {}
     expected_start = 1
     total = None
-    for number in range(1, PAGE_LIMIT + 1):
+    pages = count(1) if page_limit is None else range(1, page_limit + 1)
+    for number in pages:
         query = urlencode({field: value, "page": number, "per_page": 10})
         page_url = f"{registry_url}?{query}"
         page = RegistryPage(fetch(page_url))

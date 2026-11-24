@@ -3,6 +3,8 @@ import logging
 import re
 import secrets
 import ssl
+import threading
+import time
 from html import escape
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
@@ -17,6 +19,7 @@ INGRESS_IP = "172.30.32.2"
 SNAPSHOT = Path("/data/registry-response.html")
 EXPORT_DIAGNOSTIC = Path("/data/registry-filter-response.html")
 EXPORT = Path("/data/registry-export.csv")
+BATCH_EXPORT = Path("/data/registry-export-all.csv")
 FILTERS = Path("/data/registry-filters.json")
 DEFAULT_FILTERS = {
     "name": [
@@ -27,6 +30,8 @@ DEFAULT_FILTERS = {
 }
 TOKEN = secrets.token_urlsafe()
 MAX_BYTES = 5 * 1024 * 1024
+batch_running = False
+batch_status = ""
 
 
 class RegistryRedirect(HTTPRedirectHandler):
@@ -48,7 +53,7 @@ def registry_tls_context():
 
 
 def fetch_registry(url):
-    request = Request(url, headers={"User-Agent": "DomisRegistry/0.3.2"})
+    request = Request(url, headers={"User-Agent": "DomisRegistry/0.4.0"})
     opener = build_opener(RegistryRedirect(), HTTPSHandler(context=registry_tls_context()))
     with opener.open(request, timeout=12) as response:
         content_type = response.headers.get_content_type()
@@ -92,22 +97,30 @@ def probe():
     return f"HTTP {status}. Получен HTML, {len(body)} байт."
 
 
-def export_registry(field, value):
+def fetch_rows(field, value, *, all_pages=False):
     last_response = None
 
     def fetch_page(url):
         nonlocal last_response
+        if all_pages:
+            time.sleep(0.5)
         last_response = None
         _, last_response = fetch_registry(url)
         return last_response.decode("utf-8")
 
     try:
-        rows, total = collect(fetch_page, URL, field, value)
+        if all_pages:
+            return collect(fetch_page, URL, field, value, page_limit=None)
+        return collect(fetch_page, URL, field, value)
     except ValueError as error:
         if last_response is not None:
             save_file(EXPORT_DIAGNOSTIC, last_response)
             raise ValueError(f"{error}. Ответ для диагностики сохранён") from error
         raise
+
+
+def export_registry(field, value):
+    rows, total = fetch_rows(field, value)
     save_file(EXPORT, csv_bytes(rows))
     if total == 0:
         return f"По фильтру «{value}» реестр не нашёл записей."
@@ -115,6 +128,37 @@ def export_registry(field, value):
     if len(rows) < total:
         summary += " В CSV сохранены первые две страницы."
     return summary
+
+
+def run_batch(filters):
+    global batch_running, batch_status
+    unique = {}
+    try:
+        for index, (field, value) in enumerate(filters, 1):
+            batch_status = f"Проверяется фильтр {index} из {len(filters)} · {value}"
+            rows, _ = fetch_rows(field, value, all_pages=True)
+            for row in rows:
+                unique.setdefault(row["record"], row)
+        save_file(BATCH_EXPORT, csv_bytes(unique.values()))
+        batch_status = f"Проверено фильтров: {len(filters)}. Уникальных записей: {len(unique)}."
+    except (OSError, ValueError) as error:
+        batch_status = f"Выгрузка остановилась на фильтре «{value}» · {error}"
+    finally:
+        batch_running = False
+        logging.info("%s", batch_status)
+
+
+def start_batch():
+    global batch_running, batch_status
+    if batch_running:
+        return "Общая выгрузка уже выполняется."
+    filters = [(field, value) for field, values in read_filters().items() for value in values]
+    if not filters:
+        raise ValueError("Добавьте хотя бы один ключевой запрос или код ТН ВЭД")
+    batch_running = True
+    batch_status = "Общая выгрузка запущена."
+    threading.Thread(target=run_batch, args=(filters,), daemon=True).start()
+    return ""
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -135,6 +179,12 @@ class Handler(BaseHTTPRequestHandler):
         csv_download = '<p><a href="./csv">Скачать CSV последней успешной выгрузки</a></p>' if EXPORT.exists() else ""
         diagnostic_download = '<p><a href="./filter-response">Скачать HTML последней ошибки выгрузки</a></p>' if EXPORT_DIAGNOSTIC.exists() else ""
         filters = read_filters()
+        batch_download = (
+            '<p><a href="./batch-csv">Скачать последний общий CSV</a></p>'
+            if BATCH_EXPORT.exists() else ""
+        )
+        batch_result = f'<p role="status">{escape(batch_status)}</p>' if batch_status else ""
+        batch_disabled = " disabled" if batch_running else ""
         options = "".join(
             f'<option value="{escape(field + ":" + value)}">{escape(label + " · " + value)}</option>'
             for field, label in (("name", "Наименование"), ("tnved", "ТН ВЭД"))
@@ -161,7 +211,15 @@ textarea {{ display: block; width: 100%; box-sizing: border-box; margin: .4rem 0
 </style>
 <main>
 <h1>Реестр опасной продукции</h1>
-<p>Пробная выгрузка сохраняет до двух страниц по одному фильтру.</p>
+<form method="post" action="./batch">
+  <input type="hidden" name="token" value="{TOKEN}">
+  <button{batch_disabled}>Выгрузить все фильтры</button>
+</form>
+{batch_result}
+<p><a href="./">Обновить статус</a></p>
+{batch_download}
+<hr>
+<p>Выгрузка по одному фильтру сохраняет до двух страниц.</p>
 {saved_control}
 <details>
 <summary>Разовый поиск</summary>
@@ -209,6 +267,8 @@ textarea {{ display: block; width: 100%; box-sizing: border-box; margin: .4rem 0
             return self.send_content(200, SNAPSHOT.read_bytes(), "application/octet-stream", SNAPSHOT.name)
         if self.path == "/csv" and EXPORT.exists():
             return self.send_content(200, EXPORT.read_bytes(), "text/csv; charset=utf-8", EXPORT.name)
+        if self.path == "/batch-csv" and BATCH_EXPORT.exists():
+            return self.send_content(200, BATCH_EXPORT.read_bytes(), "text/csv; charset=utf-8", BATCH_EXPORT.name)
         if self.path == "/filter-response" and EXPORT_DIAGNOSTIC.exists():
             return self.send_content(
                 200, EXPORT_DIAGNOSTIC.read_bytes(), "application/octet-stream", EXPORT_DIAGNOSTIC.name
@@ -218,7 +278,7 @@ textarea {{ display: block; width: 100%; box-sizing: border-box; margin: .4rem 0
     def do_POST(self):
         if self.client_address[0] != INGRESS_IP:
             return self.send_error(403)
-        if self.path not in ("/probe", "/export", "/filters"):
+        if self.path not in ("/probe", "/export", "/filters", "/batch"):
             return self.send_error(404)
         try:
             length = int(self.headers.get("Content-Length", "0"))
@@ -230,7 +290,11 @@ textarea {{ display: block; width: 100%; box-sizing: border-box; margin: .4rem 0
         if fields.get("token") != [TOKEN]:
             return self.send_error(403)
         try:
-            if self.path == "/export":
+            if self.path == "/batch":
+                result = start_batch()
+            elif self.path in ("/export", "/probe") and batch_running:
+                result = "Дождитесь завершения общей выгрузки."
+            elif self.path == "/export":
                 if "preset" in fields:
                     field, _, value = fields["preset"][0].partition(":")
                     if value not in read_filters().get(field, []):

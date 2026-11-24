@@ -53,7 +53,7 @@ def registry_tls_context():
 
 
 def fetch_registry(url):
-    request = Request(url, headers={"User-Agent": "DomisRegistry/0.4.0"})
+    request = Request(url, headers={"User-Agent": "DomisRegistry/0.4.1"})
     opener = build_opener(RegistryRedirect(), HTTPSHandler(context=registry_tls_context()))
     with opener.open(request, timeout=12) as response:
         content_type = response.headers.get_content_type()
@@ -183,8 +183,11 @@ class Handler(BaseHTTPRequestHandler):
             '<p><a href="./batch-csv">Скачать последний общий CSV</a></p>'
             if BATCH_EXPORT.exists() else ""
         )
-        batch_result = f'<p role="status">{escape(batch_status)}</p>' if batch_status else ""
-        batch_disabled = " disabled" if batch_running else ""
+        running = batch_running
+        status = batch_status
+        batch_result = f'<p role="status">{escape(status)}</p>' if status else ""
+        batch_disabled = " disabled" if running else ""
+        refresh = '<meta http-equiv="refresh" content="3;url=./">' if running else ""
         options = "".join(
             f'<option value="{escape(field + ":" + value)}">{escape(label + " · " + value)}</option>'
             for field, label in (("name", "Наименование"), ("tnved", "ТН ВЭД"))
@@ -202,6 +205,7 @@ class Handler(BaseHTTPRequestHandler):
 <html lang="ru">
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+{refresh}
 <title>Domis Registry</title>
 <style>
 body {{ font: 1.05rem system-ui, sans-serif; margin: 3rem auto; max-width: 42rem; padding: 0 1rem; }}
@@ -309,7 +313,8 @@ textarea {{ display: block; width: 100%; box-sizing: border-box; margin: .4rem 0
                 result = probe()
         except (OSError, ValueError) as error:
             result = f"Ошибка: {error}"
-        logging.info("%s", result)
+        if result:
+            logging.info("%s", result)
         self.show_page(result)
 
 

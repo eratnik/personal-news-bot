@@ -28,6 +28,8 @@ class RegistryPage(HTMLParser):
         self.field = None
         self.info = False
         self.grid_seen = False
+        self.pagination_seen = False
+        self.footer_seen = False
         self.empty_block = False
         self.empty_paragraph = False
         self.empty_message = ""
@@ -41,6 +43,10 @@ class RegistryPage(HTMLParser):
             self.filters[attrs["name"]] = attrs.get("value") or ""
         if tag == "div" and attrs.get("id") == "cardsGrid":
             self.grid_seen = True
+        if "pagination-bar" in classes or attrs.get("id") in ("pagination", "pageInfo"):
+            self.pagination_seen = True
+        if tag == "footer" and attrs.get("role") == "contentinfo":
+            self.footer_seen = True
         if tag == "div" and "cards-empty" in classes:
             self.empty_block = True
         if tag == "p" and self.empty_block:
@@ -99,9 +105,12 @@ def collect(fetch, registry_url, field, value, page_limit=PAGE_LIMIT):
         if not page.grid_seen:
             raise ValueError(f"Страница {number}. В ответе реестра отсутствует блок карточек")
         match = re.fullmatch(r"Показано ([0-9]+) [–-] ([0-9]+) из ([0-9]+)", info)
-        if not match:
+        if match:
+            start, end, page_total = map(int, match.groups())
+        elif number == 1 and not page.pagination_seen and page.footer_seen and 1 <= len(page.rows) <= 10:
+            start, end, page_total = 1, len(page.rows), len(page.rows)
+        else:
             raise ValueError(f"Страница {number}. Реестр не вернул проверяемый диапазон записей")
-        start, end, page_total = map(int, match.groups())
         if (start, end, page_total) == (0, 0, 0) and not page.rows and number == 1:
             return [], 0
         if (

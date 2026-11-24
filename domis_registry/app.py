@@ -1,3 +1,4 @@
+import csv
 import json
 import logging
 import re
@@ -12,6 +13,7 @@ from urllib.error import HTTPError
 from urllib.parse import parse_qs, urlsplit
 from urllib.request import HTTPRedirectHandler, HTTPSHandler, Request, build_opener
 
+from catalog_match import CATALOG_URL, compare
 from registry_export import collect, csv_bytes
 
 URL = "https://danger.gskp.by/products-registry"
@@ -20,6 +22,7 @@ SNAPSHOT = Path("/data/registry-response.html")
 EXPORT_DIAGNOSTIC = Path("/data/registry-filter-response.html")
 EXPORT = Path("/data/registry-export.csv")
 BATCH_EXPORT = Path("/data/registry-export-all.csv")
+MATCH_REPORT = Path("/data/domis-registry-matches.csv")
 FILTERS = Path("/data/registry-filters.json")
 DEFAULT_FILTERS = {
     "name": [
@@ -34,11 +37,11 @@ batch_running = False
 batch_status = ""
 
 
-class RegistryRedirect(HTTPRedirectHandler):
+class SameHostRedirect(HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         target = urlsplit(newurl)
-        if target.scheme != "https" or target.netloc.lower() != "danger.gskp.by":
-            raise HTTPError(newurl, code, "Redirect outside registry", headers, fp)
+        if target.scheme != "https" or target.netloc.lower() != urlsplit(req.full_url).netloc.lower():
+            raise HTTPError(newurl, code, "Redirect outside source host", headers, fp)
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
@@ -53,8 +56,8 @@ def registry_tls_context():
 
 
 def fetch_registry(url):
-    request = Request(url, headers={"User-Agent": "DomisRegistry/0.4.1"})
-    opener = build_opener(RegistryRedirect(), HTTPSHandler(context=registry_tls_context()))
+    request = Request(url, headers={"User-Agent": "DomisRegistry/0.5.0"})
+    opener = build_opener(SameHostRedirect(), HTTPSHandler(context=registry_tls_context()))
     with opener.open(request, timeout=12) as response:
         content_type = response.headers.get_content_type()
         body = response.read(MAX_BYTES + 1)
@@ -130,33 +133,58 @@ def export_registry(field, value):
     return summary
 
 
-def run_batch(filters):
+def compare_with_catalog():
+    request = Request(CATALOG_URL, headers={"User-Agent": "DomisRegistry/0.5.0"})
+    with build_opener(SameHostRedirect()).open(request, timeout=20) as response:
+        payload = response.read(MAX_BYTES + 1)
+        if len(payload) > MAX_BYTES:
+            raise ValueError("Каталог domis.by превышает допустимый размер")
+    registry = BATCH_EXPORT.read_text(encoding="utf-8-sig")
+    report, products, matches = compare(registry, payload)
+    save_file(MATCH_REPORT, report)
+    return f"Товаров в каталоге: {products}. Возможных совпадений: {matches}."
+
+
+def run_batch(filters=None):
     global batch_running, batch_status
     unique = {}
+    phase = "Сверка с каталогом"
+    summary = ""
     try:
-        for index, (field, value) in enumerate(filters, 1):
-            batch_status = f"Проверяется фильтр {index} из {len(filters)} · {value}"
-            rows, _ = fetch_rows(field, value, all_pages=True)
-            for row in rows:
-                unique.setdefault(row["record"], row)
-        save_file(BATCH_EXPORT, csv_bytes(unique.values()))
-        batch_status = f"Проверено фильтров: {len(filters)}. Уникальных записей: {len(unique)}."
-    except (OSError, ValueError) as error:
-        batch_status = f"Выгрузка остановилась на фильтре «{value}» · {error}"
+        if filters is not None:
+            for index, (field, value) in enumerate(filters, 1):
+                phase = f"Выгрузка по фильтру «{value}»"
+                batch_status = f"Проверяется фильтр {index} из {len(filters)} · {value}"
+                rows, _ = fetch_rows(field, value, all_pages=True)
+                for row in rows:
+                    unique.setdefault(row["record"], row)
+            phase = "Сохранение общего CSV"
+            save_file(BATCH_EXPORT, csv_bytes(unique.values()))
+            summary = f"Проверено фильтров: {len(filters)}. Уникальных записей: {len(unique)}. "
+        phase = "Сверка с каталогом"
+        batch_status = summary + "Загружается каталог domis.by."
+        batch_status = summary + compare_with_catalog()
+    except (OSError, ValueError, csv.Error) as error:
+        batch_status = f"{summary}Ошибка на этапе «{phase}» · {error}"
     finally:
         batch_running = False
         logging.info("%s", batch_status)
 
 
-def start_batch():
+def start_batch(*, compare_only=False):
     global batch_running, batch_status
     if batch_running:
         return "Общая выгрузка уже выполняется."
-    filters = [(field, value) for field, values in read_filters().items() for value in values]
-    if not filters:
-        raise ValueError("Добавьте хотя бы один ключевой запрос или код ТН ВЭД")
+    filters = None
+    if compare_only:
+        if not BATCH_EXPORT.exists():
+            raise ValueError("Сначала создайте общую выгрузку реестра")
+    else:
+        filters = [(field, value) for field, values in read_filters().items() for value in values]
+        if not filters:
+            raise ValueError("Добавьте хотя бы один ключевой запрос или код ТН ВЭД")
     batch_running = True
-    batch_status = "Общая выгрузка запущена."
+    batch_status = "Сверка запущена." if compare_only else "Общая выгрузка запущена."
     threading.Thread(target=run_batch, args=(filters,), daemon=True).start()
     return ""
 
@@ -182,6 +210,10 @@ class Handler(BaseHTTPRequestHandler):
         batch_download = (
             '<p><a href="./batch-csv">Скачать последний общий CSV</a></p>'
             if BATCH_EXPORT.exists() else ""
+        )
+        match_download = (
+            '<p><a href="./matches">Скачать последний отчёт сверки</a></p>'
+            if MATCH_REPORT.exists() else ""
         )
         running = batch_running
         status = batch_status
@@ -219,8 +251,13 @@ textarea {{ display: block; width: 100%; box-sizing: border-box; margin: .4rem 0
   <input type="hidden" name="token" value="{TOKEN}">
   <button{batch_disabled}>Выгрузить все фильтры</button>
 </form>
+<form method="post" action="./compare">
+  <input type="hidden" name="token" value="{TOKEN}">
+  <button{batch_disabled}>Сверить последний общий CSV с domis.by</button>
+</form>
 {batch_result}
 <p><a href="./">Обновить статус</a></p>
+{match_download}
 {batch_download}
 <hr>
 <p>Выгрузка по одному фильтру сохраняет до двух страниц.</p>
@@ -273,6 +310,8 @@ textarea {{ display: block; width: 100%; box-sizing: border-box; margin: .4rem 0
             return self.send_content(200, EXPORT.read_bytes(), "text/csv; charset=utf-8", EXPORT.name)
         if self.path == "/batch-csv" and BATCH_EXPORT.exists():
             return self.send_content(200, BATCH_EXPORT.read_bytes(), "text/csv; charset=utf-8", BATCH_EXPORT.name)
+        if self.path == "/matches" and MATCH_REPORT.exists():
+            return self.send_content(200, MATCH_REPORT.read_bytes(), "text/csv; charset=utf-8", MATCH_REPORT.name)
         if self.path == "/filter-response" and EXPORT_DIAGNOSTIC.exists():
             return self.send_content(
                 200, EXPORT_DIAGNOSTIC.read_bytes(), "application/octet-stream", EXPORT_DIAGNOSTIC.name
@@ -282,7 +321,7 @@ textarea {{ display: block; width: 100%; box-sizing: border-box; margin: .4rem 0
     def do_POST(self):
         if self.client_address[0] != INGRESS_IP:
             return self.send_error(403)
-        if self.path not in ("/probe", "/export", "/filters", "/batch"):
+        if self.path not in ("/probe", "/export", "/filters", "/batch", "/compare"):
             return self.send_error(404)
         try:
             length = int(self.headers.get("Content-Length", "0"))
@@ -296,6 +335,8 @@ textarea {{ display: block; width: 100%; box-sizing: border-box; margin: .4rem 0
         try:
             if self.path == "/batch":
                 result = start_batch()
+            elif self.path == "/compare":
+                result = start_batch(compare_only=True)
             elif self.path in ("/export", "/probe") and batch_running:
                 result = "Дождитесь завершения общей выгрузки."
             elif self.path == "/export":

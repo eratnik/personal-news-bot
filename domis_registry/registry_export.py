@@ -78,11 +78,13 @@ def collect(fetch, registry_url, field, value):
         page_url = f"{registry_url}?{query}"
         page = RegistryPage(fetch(page_url))
         info = " ".join(page.page_info.split())
-        if not page.grid_seen or page.filters.get(field) != value:
-            raise ValueError("Фильтр или структура выдачи не подтверждены")
+        if page.filters.get(field) != value:
+            raise ValueError(f"Страница {number}. Реестр не подтвердил значение фильтра «{value}»")
+        if not page.grid_seen:
+            raise ValueError(f"Страница {number}. В ответе реестра отсутствует блок карточек")
         match = re.fullmatch(r"Показано ([0-9]+) [–-] ([0-9]+) из ([0-9]+)", info)
         if not match:
-            raise ValueError("Реестр не вернул проверяемый диапазон записей")
+            raise ValueError(f"Страница {number}. Реестр не вернул проверяемый диапазон записей")
         start, end, page_total = map(int, match.groups())
         if (start, end, page_total) == (0, 0, 0) and not page.rows and number == 1:
             return [], 0

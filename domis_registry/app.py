@@ -15,6 +15,7 @@ from registry_export import collect, csv_bytes
 URL = "https://danger.gskp.by/products-registry"
 INGRESS_IP = "172.30.32.2"
 SNAPSHOT = Path("/data/registry-response.html")
+EXPORT_DIAGNOSTIC = Path("/data/registry-filter-response.html")
 EXPORT = Path("/data/registry-export.csv")
 FILTERS = Path("/data/registry-filters.json")
 DEFAULT_FILTERS = {
@@ -47,7 +48,7 @@ def registry_tls_context():
 
 
 def fetch_registry(url):
-    request = Request(url, headers={"User-Agent": "DomisRegistry/0.3.0"})
+    request = Request(url, headers={"User-Agent": "DomisRegistry/0.3.1"})
     opener = build_opener(RegistryRedirect(), HTTPSHandler(context=registry_tls_context()))
     with opener.open(request, timeout=12) as response:
         content_type = response.headers.get_content_type()
@@ -92,7 +93,21 @@ def probe():
 
 
 def export_registry(field, value):
-    rows, total = collect(lambda url: fetch_registry(url)[1].decode("utf-8"), URL, field, value)
+    last_response = None
+
+    def fetch_page(url):
+        nonlocal last_response
+        last_response = None
+        _, last_response = fetch_registry(url)
+        return last_response.decode("utf-8")
+
+    try:
+        rows, total = collect(fetch_page, URL, field, value)
+    except ValueError as error:
+        if last_response is not None:
+            save_file(EXPORT_DIAGNOSTIC, last_response)
+            raise ValueError(f"{error}. Ответ для диагностики сохранён") from error
+        raise
     save_file(EXPORT, csv_bytes(rows))
     summary = f"Фильтр «{value}». Выгружено {len(rows)} из {total} записей."
     if len(rows) < total:
@@ -116,6 +131,7 @@ class Handler(BaseHTTPRequestHandler):
         result = f'<p role="status">{escape(status_message)}</p>' if status_message else ""
         download = '<p><a href="./snapshot">Скачать последний ответ HTML</a></p>' if SNAPSHOT.exists() else ""
         csv_download = '<p><a href="./csv">Скачать CSV последней успешной выгрузки</a></p>' if EXPORT.exists() else ""
+        diagnostic_download = '<p><a href="./filter-response">Скачать HTML последней ошибки выгрузки</a></p>' if EXPORT_DIAGNOSTIC.exists() else ""
         filters = read_filters()
         options = "".join(
             f'<option value="{escape(field + ":" + value)}">{escape(label + " · " + value)}</option>'
@@ -161,6 +177,7 @@ textarea {{ display: block; width: 100%; box-sizing: border-box; margin: .4rem 0
 </details>
 {result}
 {csv_download}
+{diagnostic_download}
 <details>
 <summary>Настройка сохранённых фильтров</summary>
 <p>Введите по одному ключевому слову, фразе или коду на строку.</p>
@@ -190,6 +207,10 @@ textarea {{ display: block; width: 100%; box-sizing: border-box; margin: .4rem 0
             return self.send_content(200, SNAPSHOT.read_bytes(), "application/octet-stream", SNAPSHOT.name)
         if self.path == "/csv" and EXPORT.exists():
             return self.send_content(200, EXPORT.read_bytes(), "text/csv; charset=utf-8", EXPORT.name)
+        if self.path == "/filter-response" and EXPORT_DIAGNOSTIC.exists():
+            return self.send_content(
+                200, EXPORT_DIAGNOSTIC.read_bytes(), "application/octet-stream", EXPORT_DIAGNOSTIC.name
+            )
         self.send_error(404)
 
     def do_POST(self):

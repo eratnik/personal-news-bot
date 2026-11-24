@@ -5,12 +5,14 @@
 - **Vino News Bot** — публикации сайтов, RSS и групп ВКонтакте в Telegram.
 - **Telegram Transcriber** — локальная расшифровка голосовых через установленный Whisper.
 
+- **Domis Registry** — проверка доступа к реестру опасной продукции с сервера Home Assistant.
+
 ## Установка
 
 1. В Home Assistant откройте **Settings → Apps → App Store**.
 2. Откройте меню ⋮ → **Repositories** и добавьте:
    `https://github.com/eratnik/personal-news-bot`
-3. Выберите **Vino News Bot** или **Telegram Transcriber**, установите и настройте приложение.
+3. Выберите нужное приложение, установите и настройте приложение.
 
 Токен Telegram и идентификаторы чатов задаются только в настройках приложения Home Assistant и не хранятся в этом репозитории.
 

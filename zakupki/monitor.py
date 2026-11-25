@@ -4,6 +4,7 @@ import html
 import io
 import json
 import os
+import re
 import secrets
 import smtplib
 import sqlite3
@@ -27,6 +28,7 @@ LOCK = threading.Lock()
 OPTIONS = {}
 LAST_ERROR = ""
 URL_KEYS = ("competitor_url", "catalog_url")
+MODEL_LETTERS = str.maketrans("авексмнортху", "abekcmhoptxy")
 
 
 class FormError(ValueError):
@@ -117,7 +119,10 @@ def parse(raw, feed_role, currency):
     catalog = {}
     for price in document.get("prices", []):
         key = price.get("priceConfigId") or price["id"]
-        catalog[str(price["id"])] = (str(key), str(price.get("priceConfigName") or key))
+        name = str(price.get("priceConfigName") or key)
+        filename = str(price.get("fileName") or "").replace(chr(92), "/").rsplit("/", 1)[-1]
+        is_parser = filename.casefold() == "parse_prices.csv" or name.casefold().startswith("парсер")
+        catalog[str(price["id"])] = (str(key), name, is_parser)
     sources = {}
     offers = {}
     names = {}
@@ -128,8 +133,8 @@ def parse(raw, feed_role, currency):
             names[item] = name.strip()
         for offer in [product, *product.get("extraPrices", [])]:
             price_id = str(offer.get("priceId") or "feed")
-            source, name = catalog.get(price_id, (price_id, price_id))
-            sources[source] = name
+            source, name, is_parser = catalog.get(price_id, (price_id, price_id, False))
+            sources[source] = (name, is_parser)
             stock = offer.get("stock")
             stock = int(stock) if str(stock).isdigit() else None
             available = offer.get("inStock")
@@ -157,16 +162,18 @@ def ingest(raw):
     now = int(time.time())
     with database() as db:
         db.executemany("REPLACE INTO product_names VALUES(?,?)", names.items())
+        role = OPTIONS.get("feed_role", "unassigned") if list(sources) == ["feed"] else "unassigned"
+        db.executemany("""INSERT INTO sources(id,name,role) VALUES(?,?,?)
+            ON CONFLICT(id) DO UPDATE SET name=excluded.name,
+            role=CASE WHEN excluded.role='parser' THEN 'parser' ELSE sources.role END""",
+            ((identifier, name, "parser" if is_parser else role)
+             for identifier, (name, is_parser) in sources.items()))
         previous = db.execute("SELECT digest FROM snapshots ORDER BY id DESC LIMIT 1").fetchone()
         if previous is None or previous["digest"] != digest:
             cursor = db.execute(
                 "INSERT INTO snapshots(digest,captured,generated) VALUES(?,?,?)",
                 (digest, now, generated),
             )
-            role = OPTIONS.get("feed_role", "unassigned") if list(sources) == ["feed"] else "unassigned"
-            db.executemany("""INSERT INTO sources(id,name,role) VALUES(?,?,?)
-                ON CONFLICT(id) DO UPDATE SET name=excluded.name""",
-                ((identifier, name, role) for identifier, name in sources.items()))
             db.executemany("INSERT INTO offers VALUES(?,?,?,?,?,?)",
                            ((cursor.lastrowid, *row) for row in offers))
             cutoff = now - max(7, int(OPTIONS.get("history_days", 90))) * 86400
@@ -272,27 +279,50 @@ def sync():
     return " · ".join(errors)
 
 
+def model_key(name):
+    return " ".join(re.findall(r"[^\W_]+", name.casefold().translate(MODEL_LETTERS)))
+
+
+def match_model(name, market):
+    key = model_key(name)
+    if not any(character.isdigit() for character in key) or len(key.split()) < 2:
+        return None
+    matches = [title for title, candidate, _ in market
+               if candidate == key or candidate.endswith(" " + key)]
+    return matches[0] if len(matches) == 1 else None
+
+
 def results(db):
     fresh = bool(OPTIONS.get("competitor_url")) and (
         time.time() - state(db, "market_checked") <= 2 * int(OPTIONS.get("poll_hours", 6)) * 3600
     )
-    return db.execute("""
+    rows = db.execute("""
         WITH recent AS (SELECT max(id) AS id FROM snapshots)
         SELECT w.item, w.target, w.name AS custom_name,
           coalesce(nullif(nullif(w.name,'ID ' || w.item),''), p.name, l.title,
                    'Название не указано') AS name,
-          min(CASE WHEN s.role='supplier' THEN o.cost END) AS buy,
-          (SELECT min(m.price) FROM market m WHERE ? AND m.title=l.title) AS market,
-          l.title AS market_title,
-          count(o.source) AS available
+          min(CASE WHEN s.id IS NOT NULL AND o.stock>0 THEN o.cost END) AS buy,
+          min(CASE WHEN s.id IS NOT NULL AND coalesce(o.stock,0)<=0 THEN o.cost END) AS unavailable_buy,
+          l.title AS manual_market_title
         FROM watch w
         LEFT JOIN offers o ON o.item=w.item AND o.snapshot=(SELECT id FROM recent)
-          AND o.stock>0
-        LEFT JOIN sources s ON s.id=o.source
+        LEFT JOIN sources s ON s.id=o.source AND s.role IN ('supplier','unassigned')
+          AND s.name NOT LIKE 'Парсер%' AND s.name NOT LIKE 'парсер%'
         LEFT JOIN market_links l ON l.item=w.item
         LEFT JOIN product_names p ON p.item=w.item
         GROUP BY w.item ORDER BY w.name COLLATE NOCASE
-    """, (fresh,)).fetchall()
+    """).fetchall()
+    market = [(row["title"], model_key(row["title"]), row["price"]) for row in db.execute(
+        "SELECT title,min(price) AS price FROM market GROUP BY title")]
+    prices = {title: price for title, _, price in market}
+    results = []
+    for row in rows:
+        entry = dict(row)
+        title = row["manual_market_title"] or match_model(row["name"], market)
+        entry["market_title"] = title
+        entry["market"] = prices.get(title) if fresh else None
+        results.append(entry)
+    return results
 
 
 def decision(row):
@@ -445,14 +475,26 @@ def page(query, error=""):
         detail = "?" + urllib.parse.urlencode({"item": row["item"]})
         identifier = f'ID {row["item"]}'
         subtitle = f'<span class="sub">{esc(identifier)}</span>'
+        buy = amount(row["buy"])
+        if row["buy"] is None and row["unavailable_buy"] is not None:
+            buy = amount(row["unavailable_buy"]) + '<span class="sub">Остаток не подтверждён</span>'
+        elif row["buy"] is None:
+            buy = '<span class="sub">Нет закупочной цены</span>'
+        market = amount(row["market"])
+        if row["market"] is None:
+            market = '<span class="sub">Нет актуальной цены</span>' if row["market_title"] else (
+                f'<a href="{esc(detail)}">Выбрать модель</a>')
         cards.append(f'<tr><td><a href="{esc(detail)}">{esc(row["name"])}</a>'
                      f'{subtitle}</td>'
-                     f'<td>{amount(row["buy"])}</td><td>{amount(row["market"])}</td>'
+                     f'<td>{buy}</td><td>{market}</td>'
                      f'<td>{amount(row["target"])}</td><td>{esc(reason or "—")}</td><td>{action}</td></tr>')
-    roles = {"unassigned": "Не учитывать", "supplier": "Поставщик"}
+    roles = {"unassigned": "Автоматически", "supplier": "Поставщик", "ignored": "Не учитывать"}
     source_forms = []
     for source in sources:
-        role = "supplier" if source["role"] == "supplier" else "unassigned"
+        if source["role"] == "parser":
+            source_forms.append(f'<p>{esc(source["name"])} <span class="sub">Парсер цен · исключён</span></p>')
+            continue
+        role = "ignored" if source["role"] == "competitor" else source["role"]
         choices = "".join(f'<option value="{key}" {"selected" if key == role else ""}>{label}</option>'
                           for key, label in roles.items())
         source_forms.append(form("role",
@@ -485,7 +527,8 @@ def page(query, error=""):
         name = selected["custom_name"]
         if name == f"ID {item}":
             name = ""
-        title = esc(selected["market_title"] or "")
+        title = esc(selected["manual_market_title"] or "")
+        detected = selected["market_title"] if not title else ""
         options = "".join(f'<option value="{esc(row["title"])}"></option>' for row in market_titles)
         edit = form("watch", f'<input type="hidden" name="item" value="{esc(item)}">'
                     f'<label>Название<input name="name" maxlength="120" value="{esc(name)}"></label>'
@@ -493,6 +536,8 @@ def page(query, error=""):
                     f'<label>Модель у конкурентов<input name="market_title" list="market-titles" value="{title}"></label>'
                     f'<datalist id="market-titles">{options}</datalist>'
                     '<button>Сохранить изменения</button>', "fields")
+        if detected:
+            edit += f'<p>Найдена в CSV по названию товара · {esc(detected)}</p>'
     elif item:
         edit = form("add", f'<input type="hidden" name="item" value="{esc(item)}">'
                     f'{"" if known else name_input}<button>Добавить к отслеживанию</button>', "fields")
@@ -547,7 +592,7 @@ def page(query, error=""):
     {"<ul class='matches'>" + "".join(search_results) + "</ul>" if search_results else ("<p>Совпадений нет</p>" if search else "")}</section>
     {history}<section><h2>Источники данных</h2>{settings}</section>
     <details><summary>Роли источников · {len(sources)}</summary>
-    <p>Отметьте оптовые прайсы ShopManager как поставщиков.</p>{"".join(source_forms)}</details>
+    <p>Оптовые цены ShopManager учитываются автоматически. Ненужный прайс можно исключить.</p>{"".join(source_forms)}</details>
     </main></html>"""
 
 
@@ -625,8 +670,9 @@ class Handler(BaseHTTPRequestHandler):
             self.save_settings(data)
             return
         with database() as db:
-            if action == "role" and data.get("role") in {"unassigned", "supplier"}:
-                db.execute("UPDATE sources SET role=? WHERE id=?", (data["role"], data["source"]))
+            if action == "role" and data.get("role") in {"unassigned", "supplier", "ignored"}:
+                db.execute("UPDATE sources SET role=? WHERE id=? AND role<>'parser'",
+                           (data["role"], data["source"]))
                 return
             item = data.get("item", "").strip()
             if not 0 < len(item) <= 120:

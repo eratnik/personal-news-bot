@@ -1,5 +1,5 @@
 name: Монитор закупок
-version: "0.1.1"
+version: "0.1.2"
 slug: zakupki
 description: История цен и сводки по закупкам
 arch:
@@ -12,6 +12,7 @@ boot: auto
 init: false
 options:
   feed_url: ""
+  competitor_url: ""
   feed_role: unassigned
   currency: BYN
   poll_hours: 6
@@ -20,6 +21,7 @@ options:
   min_gap_percent: 15
 schema:
   feed_url: password
+  competitor_url: password
   feed_role: list(unassigned|supplier|competitor)
   currency: str
   poll_hours: int(1,168)

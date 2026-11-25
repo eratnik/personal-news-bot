@@ -1,5 +1,7 @@
+import csv
 import hashlib
 import html
+import io
 import json
 import os
 import secrets
@@ -60,6 +62,15 @@ def initialize():
             ) WITHOUT ROWID;
             CREATE INDEX IF NOT EXISTS offers_item ON offers(item, snapshot);
             CREATE TABLE IF NOT EXISTS state (key TEXT PRIMARY KEY, value INTEGER);
+            CREATE TABLE IF NOT EXISTS market_links (item TEXT PRIMARY KEY, title TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS market (
+                title TEXT NOT NULL, shop TEXT NOT NULL, price INTEGER,
+                PRIMARY KEY(title,shop)
+            );
+            CREATE TABLE IF NOT EXISTS market_history (
+                observed INTEGER NOT NULL, title TEXT NOT NULL, shop TEXT NOT NULL,
+                price INTEGER NOT NULL, PRIMARY KEY(title,observed,shop)
+            );
         """)
 
 
@@ -152,8 +163,7 @@ def ingest(raw):
     return len(offers)
 
 
-def sync():
-    url = OPTIONS["feed_url"]
+def download(url):
     if urllib.parse.urlsplit(url).scheme != "https":
         raise ValueError("HTTPS is required")
     with urllib.request.urlopen(url, timeout=30) as response:
@@ -162,21 +172,83 @@ def sync():
         raw = response.read(LIMIT + 1)
     if len(raw) > LIMIT:
         raise ValueError("Feed too large")
-    return ingest(raw)
+    return raw
+
+
+def parse_market(raw):
+    try:
+        content = raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        content = raw.decode("cp1251")
+    reader = csv.DictReader(io.StringIO(content), delimiter=";")
+    fields = reader.fieldnames or []
+    if fields[:1] != ["title"] or len(fields) < 2 or len(set(fields)) != len(fields):
+        raise ValueError("Invalid competitor CSV header")
+    entries = {}
+    for row in reader:
+        title = (row.get("title") or "").strip()
+        if not title:
+            continue
+        for shop in fields[1:]:
+            price = money(row.get(shop))
+            key = (title, shop)
+            if key not in entries or (price is not None and
+                    (entries[key] is None or price < entries[key])):
+                entries[key] = price
+    if not entries:
+        raise ValueError("Empty competitor CSV")
+    return entries
+
+
+def sync_market():
+    entries = parse_market(download(OPTIONS["competitor_url"]))
+    now = int(time.time())
+    with database() as db:
+        old = {(row[0], row[1]): row[2] for row in db.execute("SELECT * FROM market")}
+        if entries != old:
+            db.execute("DELETE FROM market")
+            db.executemany("INSERT INTO market VALUES(?,?,?)",
+                           ((title, shop, price) for (title, shop), price in entries.items()))
+            db.executemany("INSERT OR REPLACE INTO market_history VALUES(?,?,?,?)",
+                           ((now, title, shop, price) for (title, shop), price in entries.items()
+                            if price is not None))
+        db.execute("DELETE FROM market_history WHERE observed<?",
+                   (now - int(OPTIONS.get("history_days", 90)) * 86400,))
+        db.execute("REPLACE INTO state VALUES('market_checked',?)", (now,))
+
+
+def sync():
+    errors = []
+    if OPTIONS.get("feed_url"):
+        try:
+            ingest(download(OPTIONS["feed_url"]))
+        except Exception as exc:
+            errors.append(f"ShopManager · ошибка загрузки ({type(exc).__name__})")
+    if OPTIONS.get("competitor_url"):
+        try:
+            sync_market()
+        except Exception as exc:
+            errors.append(f"Конкуренты · ошибка загрузки ({type(exc).__name__})")
+    return " · ".join(errors)
 
 
 def results(db):
+    fresh = bool(OPTIONS.get("competitor_url")) and (
+        time.time() - state(db, "market_checked") <= 2 * int(OPTIONS.get("poll_hours", 6)) * 3600
+    )
     return db.execute("""
         WITH recent AS (SELECT max(id) AS id FROM snapshots)
         SELECT w.*, min(CASE WHEN s.role='supplier' THEN o.cost END) AS buy,
-          min(CASE WHEN s.role='competitor' THEN o.retail END) AS market,
+          (SELECT min(m.price) FROM market m WHERE ? AND m.title=l.title) AS market,
+          l.title AS market_title,
           count(o.source) AS available
         FROM watch w
         LEFT JOIN offers o ON o.item=w.item AND o.snapshot=(SELECT id FROM recent)
           AND o.stock>0
         LEFT JOIN sources s ON s.id=o.source
+        LEFT JOIN market_links l ON l.item=w.item
         GROUP BY w.item ORDER BY w.name COLLATE NOCASE
-    """).fetchall()
+    """, (fresh,)).fetchall()
 
 
 def decision(row):
@@ -262,13 +334,14 @@ def worker():
         try:
             with LOCK:
                 with database() as db:
-                    checked = state(db, "checked")
+                    checked = [state(db, key) for option, key in
+                               (("feed_url", "checked"), ("competitor_url", "market_checked"))
+                               if OPTIONS.get(option)]
                 now = time.time()
-                if (OPTIONS.get("feed_url") and now - last_attempt >= 300
-                        and now - checked >= int(OPTIONS.get("poll_hours", 6)) * 3600):
+                if (checked and now - last_attempt >= 300
+                        and now - min(checked) >= int(OPTIONS.get("poll_hours", 6)) * 3600):
                     last_attempt = now
-                    sync()
-                    LAST_ERROR = ""
+                    LAST_ERROR = sync()
                 send_due()
         except Exception as exc:
             LAST_ERROR = f"Ошибка фоновой задачи ({type(exc).__name__})"
@@ -290,9 +363,14 @@ def page(query, error=""):
     item = query.get("item", [""])[0][:120]
     with database() as db:
         checked = state(db, "checked")
+        market_checked = state(db, "market_checked")
         latest = db.execute("SELECT max(id) FROM snapshots").fetchone()[0]
         rows = results(db)
         selected = next((row for row in rows if row["item"] == item), None)
+        market_titles = db.execute("SELECT DISTINCT title FROM market ORDER BY title").fetchall() if selected else []
+        market_rows = db.execute("""SELECT datetime(observed,'unixepoch','+3 hours') AS stamp,
+            shop, price FROM market_history WHERE title=? ORDER BY observed DESC,shop LIMIT 200""",
+            (selected["market_title"],)).fetchall() if selected and selected["market_title"] else []
         found = db.execute("""SELECT DISTINCT item FROM offers WHERE snapshot=?
             AND instr(item,?)>0 ORDER BY item LIMIT 20""", (latest, search)).fetchall() if search else []
         sources = db.execute("SELECT * FROM sources ORDER BY name").fetchall()
@@ -301,6 +379,10 @@ def page(query, error=""):
             JOIN sources s ON s.id=o.source WHERE o.item=? ORDER BY o.snapshot DESC, s.name LIMIT 200
             """, (item,)).fetchall() if item else []
     refreshed = datetime.fromtimestamp(checked, timezone.utc).strftime("%d.%m.%Y %H:%M UTC") if checked else "ожидается"
+    market_time = "укажите competitor_url в настройках"
+    if OPTIONS.get("competitor_url"):
+        market_time = datetime.fromtimestamp(market_checked, timezone.utc).strftime(
+            "%d.%m.%Y %H:%M UTC") if market_checked else "ожидается"
     currency = esc(OPTIONS.get("currency", "BYN"))
     cards = []
     for row in sorted(rows, key=lambda row: not decision(row)[1]):
@@ -314,10 +396,11 @@ def page(query, error=""):
                      f'{subtitle}</td>'
                      f'<td>{amount(row["buy"])}</td><td>{amount(row["market"])}</td>'
                      f'<td>{amount(row["target"])}</td><td>{esc(reason or "—")}</td><td>{action}</td></tr>')
-    roles = {"unassigned": "Без роли", "supplier": "Поставщик", "competitor": "Конкурент"}
+    roles = {"unassigned": "Не учитывать", "supplier": "Поставщик"}
     source_forms = []
     for source in sources:
-        choices = "".join(f'<option value="{key}" {"selected" if key == source["role"] else ""}>{label}</option>'
+        role = "supplier" if source["role"] == "supplier" else "unassigned"
+        choices = "".join(f'<option value="{key}" {"selected" if key == role else ""}>{label}</option>'
                           for key, label in roles.items())
         source_forms.append(form("role",
             f'<input type="hidden" name="source" value="{esc(source["id"])}">'
@@ -339,9 +422,13 @@ def page(query, error=""):
     if selected:
         target = amount(selected["target"]) if selected["target"] is not None else ""
         name = selected["name"] if selected["name"] != f"ID {item}" else ""
+        title = esc(selected["market_title"] or "")
+        options = "".join(f'<option value="{esc(row["title"])}"></option>' for row in market_titles)
         edit = form("watch", f'<input type="hidden" name="item" value="{esc(item)}">'
                     f'<label>Название<input name="name" maxlength="120" value="{esc(name)}"></label>'
                     f'<label>Закупочный лимит<input name="target" inputmode="decimal" value="{target}"></label>'
+                    f'<label>Модель у конкурентов<input name="market_title" list="market-titles" value="{title}"></label>'
+                    f'<datalist id="market-titles">{options}</datalist>'
                     '<button>Сохранить изменения</button>', "fields")
     history = ""
     if item:
@@ -352,7 +439,13 @@ def page(query, error=""):
         history = f'<section><h2>Товар {esc(item)}</h2>{edit}<h3>История цен</h3><div class="table"><table><thead><tr><th>Минск</th>'
         history += '<th>Источник</th><th>Цена</th><th>Закупка</th><th>Остаток</th></tr></thead>'
         history += f'<tbody>{history_rows}</tbody></table></div></section>'
-    sync_button = form("sync", '<button class="quiet">Обновить цены</button>') if OPTIONS.get("feed_url") else ""
+        if market_rows:
+            prices = "".join(f'<tr><td>{esc(row["stamp"])}</td><td>{esc(row["shop"])}</td>'
+                             f'<td>{amount(row["price"])}</td></tr>' for row in market_rows)
+            history += ('<section><h2>История цен конкурентов</h2><div class="table"><table>'
+                        '<thead><tr><th>Минск</th><th>Магазин</th><th>Цена</th></tr></thead>'
+                        f'<tbody>{prices}</tbody></table></div></section>')
+    sync_button = form("sync", '<button class="quiet">Обновить цены</button>')
     problem = f'<p class="error" role="alert">{esc(error or LAST_ERROR)}</p>' if error or LAST_ERROR else ""
     table = (f'<div class="table"><table><thead><tr><th>Товар</th><th>Закупка</th><th>Конкуренты</th><th>Лимит</th>'
              f'<th>Основание</th><th></th></tr></thead><tbody>{"".join(cards)}</tbody></table></div>'
@@ -375,7 +468,8 @@ def page(query, error=""):
     td,th{{border-bottom:1px solid #edf1ef;padding:11px;white-space:nowrap}} th{{font-size:14px}}
     summary{{cursor:pointer;font-weight:650}} .error{{color:#9b2828}}
     .matches{{list-style:none;padding:0}} .matches li{{display:flex;gap:14px;align-items:center;margin:8px 0}}
-    </style><main><header><div><h1>Монитор закупок</h1><p>Проверка цен · {refreshed} · {currency}</p></div>{sync_button}</header>
+    </style><main><header><div><h1>Монитор закупок</h1><p>ShopManager · {refreshed}<br>
+    Конкуренты · {market_time} · {currency}</p></div>{sync_button}</header>
     {problem}<section><h2>Список наблюдения · {len(rows)}</h2>{table}</section>
     <section><h2>Добавить товар</h2>
     {add}
@@ -383,7 +477,7 @@ def page(query, error=""):
     <button class="quiet">Найти</button></form>
     {"<ul class='matches'>" + "".join(search_results) + "</ul>" if search_results else ("<p>Совпадений нет</p>" if search else "")}</section>
     {history}<details><summary>Роли источников · {len(sources)}</summary>
-    <p>Укажите поставщиков и конкурентов для расчёта рекомендаций.</p>{"".join(source_forms)}</details>
+    <p>Отметьте оптовые прайсы ShopManager как поставщиков.</p>{"".join(source_forms)}</details>
     </main></html>"""
 
 
@@ -419,20 +513,18 @@ class Handler(BaseHTTPRequestHandler):
             if not 0 < length <= 8192:
                 self.send_error(413)
                 return
-            data = dict(urllib.parse.parse_qsl(self.rfile.read(length).decode(), max_num_fields=10))
+            data = dict(urllib.parse.parse_qsl(self.rfile.read(length).decode(),
+                                             keep_blank_values=True, max_num_fields=10))
             if not secrets.compare_digest(data.get("token", ""), TOKEN):
                 self.send_error(403)
                 return
             action = data.get("action")
             if action == "sync":
-                if not OPTIONS.get("feed_url"):
-                    raise ValueError("Feed URL missing")
                 if not LOCK.acquire(blocking=False):
                     self.render({}, "Уже выполняется фоновая задача.", 409)
                     return
                 try:
-                    sync()
-                    LAST_ERROR = ""
+                    LAST_ERROR = sync()
                 finally:
                     LOCK.release()
             else:
@@ -450,7 +542,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def change(self, data, action):
         with database() as db:
-            if action == "role" and data.get("role") in {"unassigned", "supplier", "competitor"}:
+            if action == "role" and data.get("role") in {"unassigned", "supplier"}:
                 db.execute("UPDATE sources SET role=? WHERE id=?", (data["role"], data["source"]))
                 return
             item = data.get("item", "").strip()
@@ -458,6 +550,7 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError("Invalid product ID")
             if action == "remove":
                 db.execute("DELETE FROM watch WHERE item=?", (item,))
+                db.execute("DELETE FROM market_links WHERE item=?", (item,))
             elif action == "add":
                 db.execute("INSERT OR IGNORE INTO watch VALUES(?,?,NULL)", (item, f"ID {item}"))
             elif action == "watch":
@@ -465,6 +558,18 @@ class Handler(BaseHTTPRequestHandler):
                 target = data.get("target", "").strip()
                 if len(name) > 120 or (target and money(target) is None):
                     raise ValueError("Invalid product")
+                market_title = data.get("market_title")
+                if market_title is not None:
+                    market_title = market_title.strip()
+                    if market_title:
+                        match = db.execute("""SELECT title FROM market WHERE title=?
+                            UNION SELECT title FROM market_links WHERE item=? AND title=?""",
+                            (market_title, item, market_title)).fetchone()
+                        if not match:
+                            raise ValueError("Unknown competitor model")
+                        db.execute("REPLACE INTO market_links VALUES(?,?)", (item, market_title))
+                    else:
+                        db.execute("DELETE FROM market_links WHERE item=?", (item,))
                 db.execute("REPLACE INTO watch VALUES(?,?,?)", (item, name or f"ID {item}", money(target)))
             else:
                 raise ValueError("Unknown action")

@@ -1,0 +1,36 @@
+name: Монитор закупок
+version: "0.1.0"
+slug: zakupki
+description: История цен и сводки по закупкам
+arch:
+  - amd64
+ingress: true
+ingress_port: 8099
+panel_icon: mdi:clipboard-list-outline
+startup: application
+boot: auto
+init: false
+options:
+  feed_url: ""
+  feed_role: unassigned
+  currency: BYN
+  poll_hours: 6
+  digest_days: 3
+  history_days: 90
+  min_gap_percent: 15
+schema:
+  feed_url: password
+  feed_role: list(unassigned|supplier|competitor)
+  currency: str
+  poll_hours: int(1,168)
+  digest_days: int(1,30)
+  history_days: int(7,365)
+  min_gap_percent: int(1,99)
+  telegram_token: password?
+  telegram_chat: str?
+  smtp_host: str?
+  smtp_port: port?
+  smtp_user: str?
+  smtp_password: password?
+  email_from: email?
+  email_to: email?

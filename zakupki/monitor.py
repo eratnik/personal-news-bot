@@ -26,6 +26,11 @@ TOKEN = secrets.token_urlsafe(32)
 LOCK = threading.Lock()
 OPTIONS = {}
 LAST_ERROR = ""
+URL_KEYS = ("competitor_url", "catalog_url")
+
+
+class FormError(ValueError):
+    pass
 
 
 @contextmanager
@@ -71,6 +76,8 @@ def initialize():
                 observed INTEGER NOT NULL, title TEXT NOT NULL, shop TEXT NOT NULL,
                 price INTEGER NOT NULL, PRIMARY KEY(title,observed,shop)
             );
+            CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS product_names (item TEXT PRIMARY KEY, name TEXT NOT NULL);
         """)
 
 
@@ -97,6 +104,7 @@ def parse(raw, feed_role, currency):
             price = offer.findtext("price")
             products.append({
                 "id": offer.attrib["id"], "price": price,
+                "name": offer.findtext("name") or offer.findtext("model"),
                 "origPriceWRate": price if feed_role == "supplier" else None,
                 "stock": int(offer.get("available", "").lower() == "true"),
             })
@@ -112,8 +120,12 @@ def parse(raw, feed_role, currency):
         catalog[str(price["id"])] = (str(key), str(price.get("priceConfigName") or key))
     sources = {}
     offers = {}
+    names = {}
     for product in document["products"]:
         item = str(product["id"])
+        name = product.get("name") or product.get("title")
+        if isinstance(name, str) and name.strip():
+            names[item] = name.strip()
         for offer in [product, *product.get("extraPrices", [])]:
             price_id = str(offer.get("priceId") or "feed")
             source, name = catalog.get(price_id, (price_id, price_id))
@@ -131,7 +143,7 @@ def parse(raw, feed_role, currency):
                 offers[(item, source)] = row
     if not offers and not document.get("staledProductsIds"):
         raise ValueError("Empty feed")
-    return str(document.get("generated") or ""), sources, list(offers.values())
+    return str(document.get("generated") or ""), sources, list(offers.values()), names
 
 
 def offer_priority(row):
@@ -140,10 +152,11 @@ def offer_priority(row):
 
 def ingest(raw):
     digest = hashlib.sha256(raw).hexdigest()
-    generated, sources, offers = parse(raw, OPTIONS.get("feed_role", "unassigned"),
-                                       OPTIONS.get("currency", "BYN"))
+    generated, sources, offers, names = parse(raw, OPTIONS.get("feed_role", "unassigned"),
+                                              OPTIONS.get("currency", "BYN"))
     now = int(time.time())
     with database() as db:
+        db.executemany("REPLACE INTO product_names VALUES(?,?)", names.items())
         previous = db.execute("SELECT digest FROM snapshots ORDER BY id DESC LIMIT 1").fetchone()
         if previous is None or previous["digest"] != digest:
             cursor = db.execute(
@@ -217,6 +230,28 @@ def sync_market():
         db.execute("REPLACE INTO state VALUES('market_checked',?)", (now,))
 
 
+def sync_catalog():
+    content = download(OPTIONS["catalog_url"]).decode("utf-8-sig").lstrip()
+    if content.startswith("<"):
+        if "<!DOCTYPE" in content.upper():
+            raise ValueError("DTD is unsupported")
+        offers = ET.fromstring(content).findall(".//offers/offer")
+        pairs = ((offer.get("id"), offer.findtext("name") or offer.findtext("model"))
+                 for offer in offers)
+    else:
+        document = json.loads(content)
+        products = document if isinstance(document, list) else document["products"]
+        pairs = ((product.get("id"), product.get("name") or product.get("title"))
+                 for product in products)
+    names = {str(item).strip(): name.strip() for item, name in pairs
+             if item is not None and str(item).strip() and isinstance(name, str) and name.strip()}
+    if not names:
+        raise ValueError("Catalog contains no product names")
+    with database() as db:
+        db.executemany("REPLACE INTO product_names VALUES(?,?)", names.items())
+        db.execute("REPLACE INTO state VALUES('catalog_checked',?)", (int(time.time()),))
+
+
 def sync():
     errors = []
     if OPTIONS.get("feed_url"):
@@ -229,6 +264,11 @@ def sync():
             sync_market()
         except Exception as exc:
             errors.append(f"Конкуренты · ошибка загрузки ({type(exc).__name__})")
+    if OPTIONS.get("catalog_url"):
+        try:
+            sync_catalog()
+        except Exception as exc:
+            errors.append(f"Каталог товаров · ошибка загрузки ({type(exc).__name__})")
     return " · ".join(errors)
 
 
@@ -238,7 +278,10 @@ def results(db):
     )
     return db.execute("""
         WITH recent AS (SELECT max(id) AS id FROM snapshots)
-        SELECT w.*, min(CASE WHEN s.role='supplier' THEN o.cost END) AS buy,
+        SELECT w.item, w.target, w.name AS custom_name,
+          coalesce(nullif(nullif(w.name,'ID ' || w.item),''), p.name, l.title,
+                   'Название не указано') AS name,
+          min(CASE WHEN s.role='supplier' THEN o.cost END) AS buy,
           (SELECT min(m.price) FROM market m WHERE ? AND m.title=l.title) AS market,
           l.title AS market_title,
           count(o.source) AS available
@@ -247,6 +290,7 @@ def results(db):
           AND o.stock>0
         LEFT JOIN sources s ON s.id=o.source
         LEFT JOIN market_links l ON l.item=w.item
+        LEFT JOIN product_names p ON p.item=w.item
         GROUP BY w.item ORDER BY w.name COLLATE NOCASE
     """, (fresh,)).fetchall()
 
@@ -335,7 +379,8 @@ def worker():
             with LOCK:
                 with database() as db:
                     checked = [state(db, key) for option, key in
-                               (("feed_url", "checked"), ("competitor_url", "market_checked"))
+                               (("feed_url", "checked"), ("competitor_url", "market_checked"),
+                                ("catalog_url", "catalog_checked"))
                                if OPTIONS.get(option)]
                 now = time.time()
                 if (checked and now - last_attempt >= 300
@@ -371,15 +416,23 @@ def page(query, error=""):
         market_rows = db.execute("""SELECT datetime(observed,'unixepoch','+3 hours') AS stamp,
             shop, price FROM market_history WHERE title=? ORDER BY observed DESC,shop LIMIT 200""",
             (selected["market_title"],)).fetchall() if selected and selected["market_title"] else []
-        found = db.execute("""SELECT DISTINCT item FROM offers WHERE snapshot=?
-            AND instr(item,?)>0 ORDER BY item LIMIT 20""", (latest, search)).fetchall() if search else []
+        found = db.execute("""WITH candidates AS (
+            SELECT item FROM offers WHERE snapshot=? AND instr(item,?)>0
+            UNION SELECT item FROM product_names WHERE instr(item,?)>0
+            UNION SELECT item FROM watch WHERE instr(item,?)>0
+            UNION SELECT item FROM offers WHERE item=?
+        )
+        SELECT c.item, p.name FROM candidates c LEFT JOIN product_names p ON p.item=c.item
+        ORDER BY c.item<>?, c.item LIMIT 20
+        """, (latest, search, search, search, search, search)).fetchall() if search else []
+        known = db.execute("SELECT name FROM product_names WHERE item=?", (item,)).fetchone() if item else None
         sources = db.execute("SELECT * FROM sources ORDER BY name").fetchall()
         details = db.execute("""SELECT datetime(t.captured,'unixepoch','+3 hours') AS stamp,
             s.name, o.retail, o.cost, o.stock FROM offers o JOIN snapshots t ON t.id=o.snapshot
             JOIN sources s ON s.id=o.source WHERE o.item=? ORDER BY o.snapshot DESC, s.name LIMIT 200
             """, (item,)).fetchall() if item else []
     refreshed = datetime.fromtimestamp(checked, timezone.utc).strftime("%d.%m.%Y %H:%M UTC") if checked else "ожидается"
-    market_time = "укажите competitor_url в настройках"
+    market_time = "укажите ссылку в разделе «Источники данных»"
     if OPTIONS.get("competitor_url"):
         market_time = datetime.fromtimestamp(market_checked, timezone.utc).strftime(
             "%d.%m.%Y %H:%M UTC") if market_checked else "ожидается"
@@ -391,7 +444,7 @@ def page(query, error=""):
                       '<button class="quiet">Убрать из списка</button>')
         detail = "?" + urllib.parse.urlencode({"item": row["item"]})
         identifier = f'ID {row["item"]}'
-        subtitle = "" if row["name"] == identifier else f'<span class="sub">{esc(identifier)}</span>'
+        subtitle = f'<span class="sub">{esc(identifier)}</span>'
         cards.append(f'<tr><td><a href="{esc(detail)}">{esc(row["name"])}</a>'
                      f'{subtitle}</td>'
                      f'<td>{amount(row["buy"])}</td><td>{amount(row["market"])}</td>'
@@ -407,21 +460,31 @@ def page(query, error=""):
             f'<label>{esc(source["name"])}<span class="sub">ID {esc(source["id"])}</span></label>'
             f'<select name="role" aria-label="Роль источника">{choices}</select><button>Сохранить</button>', "source"))
     watched = {row["item"] for row in rows}
+    name_input = '<label>Название товара<input name="name" maxlength="120"></label>'
     search_results = []
     for row in found:
         found_id = row["item"]
         link = "?" + urllib.parse.urlencode({"item": found_id})
-        control = ('<span class="sub">В списке</span>' if found_id in watched else form(
+        control = ('<span class="sub">В списке наблюдения</span>' if found_id in watched else form(
             "add", f'<input type="hidden" name="item" value="{esc(found_id)}">'
             f'<input type="hidden" name="q" value="{esc(search)}">'
-            f'<button class="quiet" aria-label="Добавить товар {esc(found_id)}">Добавить</button>'))
-        search_results.append(f'<li><a href="{esc(link)}">ID {esc(found_id)}</a>{control}</li>')
-    add = form("add", '<label>ID товара<input name="item" required maxlength="120"></label>'
-               '<button>Добавить по ID</button>', "fields")
+            f'{"" if row["name"] else name_input}<button>Добавить к отслеживанию</button>', "fields"))
+        caption = f'{row["name"]} · ID {found_id}' if row["name"] else f'ID {found_id}'
+        search_results.append(f'<li><a href="{esc(link)}">{esc(caption)}</a>{control}</li>')
+    add = form("add", f'<label>ID товара<input name="item" required maxlength="120" value="{esc(query.get("add_id", [""])[0])}"></label>'
+               f'{name_input}<button>Добавить по ID</button>', "fields")
+    settings = form("settings",
+        f'<label>Ссылка на CSV конкурентов<input type="password" autocomplete="off" name="competitor_url" '
+        f'value="{esc(OPTIONS.get("competitor_url") or "")}"></label>'
+        f'<label>Ссылка на каталог названий (JSON или YML)<input type="password" autocomplete="off" name="catalog_url" '
+        f'value="{esc(OPTIONS.get("catalog_url") or "")}"></label>'
+        '<button>Сохранить источники</button>', "fields")
     edit = ""
     if selected:
         target = amount(selected["target"]) if selected["target"] is not None else ""
-        name = selected["name"] if selected["name"] != f"ID {item}" else ""
+        name = selected["custom_name"]
+        if name == f"ID {item}":
+            name = ""
         title = esc(selected["market_title"] or "")
         options = "".join(f'<option value="{esc(row["title"])}"></option>' for row in market_titles)
         edit = form("watch", f'<input type="hidden" name="item" value="{esc(item)}">'
@@ -430,13 +493,17 @@ def page(query, error=""):
                     f'<label>Модель у конкурентов<input name="market_title" list="market-titles" value="{title}"></label>'
                     f'<datalist id="market-titles">{options}</datalist>'
                     '<button>Сохранить изменения</button>', "fields")
+    elif item:
+        edit = form("add", f'<input type="hidden" name="item" value="{esc(item)}">'
+                    f'{"" if known else name_input}<button>Добавить к отслеживанию</button>', "fields")
     history = ""
     if item:
         history_rows = "".join(f'<tr><td>{esc(row["stamp"])}</td><td>{esc(row["name"])}</td>'
                                f'<td>{amount(row["retail"])}</td><td>{amount(row["cost"])}</td>'
                                f'<td>{esc(row["stock"] if row["stock"] is not None else "—")}</td></tr>'
                                for row in details)
-        history = f'<section><h2>Товар {esc(item)}</h2>{edit}<h3>История цен</h3><div class="table"><table><thead><tr><th>Минск</th>'
+        heading = selected["name"] if selected else (known["name"] if known else f"Товар {item}")
+        history = f'<section><h2>{esc(heading)}</h2>{edit}<h3>История цен</h3><div class="table"><table><thead><tr><th>Минск</th>'
         history += '<th>Источник</th><th>Цена</th><th>Закупка</th><th>Остаток</th></tr></thead>'
         history += f'<tbody>{history_rows}</tbody></table></div></section>'
         if market_rows:
@@ -467,16 +534,19 @@ def page(query, error=""):
     .table{{overflow:auto}} table{{border-collapse:collapse;width:100%;text-align:left}}
     td,th{{border-bottom:1px solid #edf1ef;padding:11px;white-space:nowrap}} th{{font-size:14px}}
     summary{{cursor:pointer;font-weight:650}} .error{{color:#9b2828}}
-    .matches{{list-style:none;padding:0}} .matches li{{display:flex;gap:14px;align-items:center;margin:8px 0}}
+    .matches{{list-style:none;padding:0}} .matches li{{display:flex;flex-wrap:wrap;gap:14px;align-items:center;margin:8px 0}}
+    .search{{margin-top:16px}}
     </style><main><header><div><h1>Монитор закупок</h1><p>ShopManager · {refreshed}<br>
     Конкуренты · {market_time} · {currency}</p></div>{sync_button}</header>
     {problem}<section><h2>Список наблюдения · {len(rows)}</h2>{table}</section>
     <section><h2>Добавить товар</h2>
+    <p>Если название есть в каталоге, достаточно ID. Для остальных товаров укажите название при добавлении.</p>
     {add}
     <form method="get" class="search"><label>Поиск ID в последней выгрузке<input name="q" value="{esc(search)}"></label>
     <button class="quiet">Найти</button></form>
     {"<ul class='matches'>" + "".join(search_results) + "</ul>" if search_results else ("<p>Совпадений нет</p>" if search else "")}</section>
-    {history}<details><summary>Роли источников · {len(sources)}</summary>
+    {history}<section><h2>Источники данных</h2>{settings}</section>
+    <details><summary>Роли источников · {len(sources)}</summary>
     <p>Отметьте оптовые прайсы ShopManager как поставщиков.</p>{"".join(source_forms)}</details>
     </main></html>"""
 
@@ -508,6 +578,7 @@ class Handler(BaseHTTPRequestHandler):
         global LAST_ERROR
         if not self.verify_request():
             return
+        data = {}
         try:
             length = int(self.headers.get("Content-Length", "0"))
             if not 0 < length <= 8192:
@@ -535,29 +606,49 @@ class Handler(BaseHTTPRequestHandler):
                 self.render({"item": [data["item"].strip()]})
             else:
                 self.render({})
+        except FormError as exc:
+            query = {}
+            if data.get("q"):
+                query["q"] = [data["q"]]
+            elif data.get("action") == "add":
+                query["add_id"] = [data.get("item", "")]
+            elif data.get("item"):
+                query["item"] = [data["item"]]
+            self.render(query, str(exc), 400)
         except (ValueError, KeyError, sqlite3.Error, OSError) as exc:
             self.render({}, f"Операция не выполнена ({type(exc).__name__}).", 400)
         except Exception as exc:
             self.render({}, f"Данные не обработаны ({type(exc).__name__}).", 502)
 
     def change(self, data, action):
+        if action == "settings":
+            self.save_settings(data)
+            return
         with database() as db:
             if action == "role" and data.get("role") in {"unassigned", "supplier"}:
                 db.execute("UPDATE sources SET role=? WHERE id=?", (data["role"], data["source"]))
                 return
             item = data.get("item", "").strip()
             if not 0 < len(item) <= 120:
-                raise ValueError("Invalid product ID")
+                raise FormError("Введите ID товара длиной до 120 символов.")
             if action == "remove":
                 db.execute("DELETE FROM watch WHERE item=?", (item,))
                 db.execute("DELETE FROM market_links WHERE item=?", (item,))
             elif action == "add":
-                db.execute("INSERT OR IGNORE INTO watch VALUES(?,?,NULL)", (item, f"ID {item}"))
+                existing = db.execute("SELECT name FROM watch WHERE item=?", (item,)).fetchone()
+                if existing:
+                    return
+                name = data.get("name", "").strip()
+                if len(name) > 120:
+                    raise FormError("Название должно быть не длиннее 120 символов.")
+                if not name and not db.execute("SELECT 1 FROM product_names WHERE item=?", (item,)).fetchone():
+                    raise FormError("Для этого ID нет названия в каталоге. Введите название товара.")
+                db.execute("INSERT OR IGNORE INTO watch VALUES(?,?,NULL)", (item, name))
             elif action == "watch":
                 name = data.get("name", "").strip()
                 target = data.get("target", "").strip()
                 if len(name) > 120 or (target and money(target) is None):
-                    raise ValueError("Invalid product")
+                    raise FormError("Проверьте название и закупочный лимит.")
                 market_title = data.get("market_title")
                 if market_title is not None:
                     market_title = market_title.strip()
@@ -566,13 +657,33 @@ class Handler(BaseHTTPRequestHandler):
                             UNION SELECT title FROM market_links WHERE item=? AND title=?""",
                             (market_title, item, market_title)).fetchone()
                         if not match:
-                            raise ValueError("Unknown competitor model")
+                            raise FormError("Выберите точное название модели из списка конкурентов.")
                         db.execute("REPLACE INTO market_links VALUES(?,?)", (item, market_title))
                     else:
                         db.execute("DELETE FROM market_links WHERE item=?", (item,))
-                db.execute("REPLACE INTO watch VALUES(?,?,?)", (item, name or f"ID {item}", money(target)))
+                db.execute("REPLACE INTO watch VALUES(?,?,?)", (item, name, money(target)))
             else:
                 raise ValueError("Unknown action")
+
+    def save_settings(self, data):
+        values = {key: data.get(key, "").strip() for key in URL_KEYS}
+        for value in values.values():
+            if not value:
+                continue
+            try:
+                url = urllib.parse.urlsplit(value)
+                if url.scheme == "https" and url.hostname and not url.username and not url.password:
+                    continue
+            except ValueError:
+                pass
+            raise FormError("Укажите полную HTTPS-ссылку на источник.")
+        with LOCK:
+            with database() as db:
+                for key, state_key in (("competitor_url", "market_checked"), ("catalog_url", "catalog_checked")):
+                    if values[key] != OPTIONS.get(key, ""):
+                        db.execute("DELETE FROM state WHERE key=?", (state_key,))
+                db.executemany("REPLACE INTO settings VALUES(?,?)", values.items())
+            OPTIONS.update(values)
 
 
 def main():
@@ -587,6 +698,8 @@ def main():
     if config.exists():
         OPTIONS = json.loads(config.read_text(encoding="utf-8"))
     initialize()
+    with database() as db:
+        OPTIONS.update({row["key"]: row["value"] for row in db.execute("SELECT key,value FROM settings")})
     if args.import_file:
         if args.import_file.stat().st_size > LIMIT:
             parser.error("Feed too large")

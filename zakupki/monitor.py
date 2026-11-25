@@ -292,6 +292,7 @@ def page(query, error=""):
         checked = state(db, "checked")
         latest = db.execute("SELECT max(id) FROM snapshots").fetchone()[0]
         rows = results(db)
+        selected = next((row for row in rows if row["item"] == item), None)
         found = db.execute("""SELECT DISTINCT item FROM offers WHERE snapshot=?
             AND instr(item,?)>0 ORDER BY item LIMIT 20""", (latest, search)).fetchall() if search else []
         sources = db.execute("SELECT * FROM sources ORDER BY name").fetchall()
@@ -307,8 +308,10 @@ def page(query, error=""):
         action = form("remove", f'<input type="hidden" name="item" value="{esc(row["item"])}">'
                       '<button class="quiet">Убрать из списка</button>')
         detail = "?" + urllib.parse.urlencode({"item": row["item"]})
+        identifier = f'ID {row["item"]}'
+        subtitle = "" if row["name"] == identifier else f'<span class="sub">{esc(identifier)}</span>'
         cards.append(f'<tr><td><a href="{esc(detail)}">{esc(row["name"])}</a>'
-                     f'<span class="sub">ID {esc(row["item"])}</span></td>'
+                     f'{subtitle}</td>'
                      f'<td>{amount(row["buy"])}</td><td>{amount(row["market"])}</td>'
                      f'<td>{amount(row["target"])}</td><td>{esc(reason or "—")}</td><td>{action}</td></tr>')
     roles = {"unassigned": "Без роли", "supplier": "Поставщик", "competitor": "Конкурент"}
@@ -320,19 +323,33 @@ def page(query, error=""):
             f'<input type="hidden" name="source" value="{esc(source["id"])}">'
             f'<label>{esc(source["name"])}<span class="sub">ID {esc(source["id"])}</span></label>'
             f'<select name="role" aria-label="Роль источника">{choices}</select><button>Сохранить</button>', "source"))
-    search_results = " ".join(f'<a href="?item={urllib.parse.quote(row["item"], safe="")}">{esc(row["item"])}</a>'
-                              for row in found)
-    add = form("watch", f'<label>ID товара<input name="item" required maxlength="120" value="{esc(item)}"></label>'
-               '<label>Название<input name="name" required maxlength="120"></label>'
-               '<label>Закупочный лимит<input name="target" inputmode="decimal" placeholder="По желанию"></label>'
-               '<button>Сохранить товар</button>', "fields")
+    watched = {row["item"] for row in rows}
+    search_results = []
+    for row in found:
+        found_id = row["item"]
+        link = "?" + urllib.parse.urlencode({"item": found_id})
+        control = ('<span class="sub">В списке</span>' if found_id in watched else form(
+            "add", f'<input type="hidden" name="item" value="{esc(found_id)}">'
+            f'<input type="hidden" name="q" value="{esc(search)}">'
+            f'<button class="quiet" aria-label="Добавить товар {esc(found_id)}">Добавить</button>'))
+        search_results.append(f'<li><a href="{esc(link)}">ID {esc(found_id)}</a>{control}</li>')
+    add = form("add", '<label>ID товара<input name="item" required maxlength="120"></label>'
+               '<button>Добавить по ID</button>', "fields")
+    edit = ""
+    if selected:
+        target = amount(selected["target"]) if selected["target"] is not None else ""
+        name = selected["name"] if selected["name"] != f"ID {item}" else ""
+        edit = form("watch", f'<input type="hidden" name="item" value="{esc(item)}">'
+                    f'<label>Название<input name="name" maxlength="120" value="{esc(name)}"></label>'
+                    f'<label>Закупочный лимит<input name="target" inputmode="decimal" value="{target}"></label>'
+                    '<button>Сохранить изменения</button>', "fields")
     history = ""
     if item:
         history_rows = "".join(f'<tr><td>{esc(row["stamp"])}</td><td>{esc(row["name"])}</td>'
                                f'<td>{amount(row["retail"])}</td><td>{amount(row["cost"])}</td>'
                                f'<td>{esc(row["stock"] if row["stock"] is not None else "—")}</td></tr>'
                                for row in details)
-        history = f'<section><h2>История товара {esc(item)}</h2><div class="table"><table><thead><tr><th>Минск</th>'
+        history = f'<section><h2>Товар {esc(item)}</h2>{edit}<h3>История цен</h3><div class="table"><table><thead><tr><th>Минск</th>'
         history += '<th>Источник</th><th>Цена</th><th>Закупка</th><th>Остаток</th></tr></thead>'
         history += f'<tbody>{history_rows}</tbody></table></div></section>'
     sync_button = form("sync", '<button class="quiet">Обновить цены</button>') if OPTIONS.get("feed_url") else ""
@@ -356,13 +373,15 @@ def page(query, error=""):
     .quiet{{color:#124c3c;background:white;border-color:#a9bcb5}} a{{color:#075840;font-weight:600}}
     .table{{overflow:auto}} table{{border-collapse:collapse;width:100%;text-align:left}}
     td,th{{border-bottom:1px solid #edf1ef;padding:11px;white-space:nowrap}} th{{font-size:14px}}
-    summary{{cursor:pointer;font-weight:650}} .error{{color:#9b2828}} .matches a{{margin-right:12px}}
+    summary{{cursor:pointer;font-weight:650}} .error{{color:#9b2828}}
+    .matches{{list-style:none;padding:0}} .matches li{{display:flex;gap:14px;align-items:center;margin:8px 0}}
     </style><main><header><div><h1>Монитор закупок</h1><p>Проверка цен · {refreshed} · {currency}</p></div>{sync_button}</header>
     {problem}<section><h2>Список наблюдения · {len(rows)}</h2>{table}</section>
-    <section><h2>Добавить или обновить товар</h2>
+    <section><h2>Добавить товар</h2>
+    {add}
     <form method="get" class="search"><label>Поиск ID в последней выгрузке<input name="q" value="{esc(search)}"></label>
     <button class="quiet">Найти</button></form>
-    <p class="matches">{search_results or ("Совпадений нет" if search else "")}</p>{add}</section>
+    {"<ul class='matches'>" + "".join(search_results) + "</ul>" if search_results else ("<p>Совпадений нет</p>" if search else "")}</section>
     {history}<details><summary>Роли источников · {len(sources)}</summary>
     <p>Укажите поставщиков и конкурентов для расчёта рекомендаций.</p>{"".join(source_forms)}</details>
     </main></html>"""
@@ -418,7 +437,12 @@ class Handler(BaseHTTPRequestHandler):
                     LOCK.release()
             else:
                 self.change(data, action)
-            self.render({})
+            if action == "add" and data.get("q"):
+                self.render({"q": [data["q"]]})
+            elif action == "watch":
+                self.render({"item": [data["item"].strip()]})
+            else:
+                self.render({})
         except (ValueError, KeyError, sqlite3.Error, OSError) as exc:
             self.render({}, f"Операция не выполнена ({type(exc).__name__}).", 400)
         except Exception as exc:
@@ -434,12 +458,14 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError("Invalid product ID")
             if action == "remove":
                 db.execute("DELETE FROM watch WHERE item=?", (item,))
+            elif action == "add":
+                db.execute("INSERT OR IGNORE INTO watch VALUES(?,?,NULL)", (item, f"ID {item}"))
             elif action == "watch":
                 name = data.get("name", "").strip()
                 target = data.get("target", "").strip()
-                if not 0 < len(name) <= 120 or (target and money(target) is None):
+                if len(name) > 120 or (target and money(target) is None):
                     raise ValueError("Invalid product")
-                db.execute("REPLACE INTO watch VALUES(?,?,?)", (item, name, money(target)))
+                db.execute("REPLACE INTO watch VALUES(?,?,?)", (item, name or f"ID {item}", money(target)))
             else:
                 raise ValueError("Unknown action")
 

@@ -1,6 +1,6 @@
 name: "Domis Registry"
 description: "Выгрузка записей реестра опасной продукции"
-version: "0.5.1"
+version: "0.5.2"
 slug: domis_registry
 arch:
   - amd64

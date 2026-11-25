@@ -10,8 +10,9 @@ FIELDS = (
     "title", "prescription", "issueDate", "effectDate", "tnved", "trts",
     "pd_number", "manufacturer", "measure", "importers", "suppliers", "violation",
 )
+PRODUCT_COLUMN = "Наименование продукции"
 FIELDS_IN_RUSSIAN = (
-    "Запись реестра", "Предписание", "Дата выдачи", "Дата введения меры",
+    PRODUCT_COLUMN, "Предписание", "Дата выдачи", "Дата введения меры",
     "ТН ВЭД", "ТР ТС", "Документ соответствия", "Производитель", "Мера",
     "Импортёры", "Поставщики", "Нарушения",
 )
@@ -131,11 +132,17 @@ def collect(fetch, registry_url, field, value, page_limit=PAGE_LIMIT):
     return list(rows.values()), total
 
 
+def product_title(record, title):
+    return title.removeprefix(f"{record}. ") if record else title
+
+
 def csv_bytes(rows):
     output = io.StringIO(newline="")
     writer = csv.writer(output, delimiter=";")
     writer.writerow(("Номер записи", *FIELDS_IN_RUSSIAN, "Ссылка на поиск записи"))
     for row in rows:
-        values = (row.get(key, "") for key in ("record", *FIELDS, "url"))
+        record = row.get("record", "")
+        title = product_title(record, row.get("title", ""))
+        values = (record, title, *(row.get(key, "") for key in (*FIELDS[1:], "url")))
         writer.writerow("'" + value if value.startswith(("=", "+", "-", "@")) and value != "-" else value for value in values)
     return output.getvalue().encode("utf-8-sig")

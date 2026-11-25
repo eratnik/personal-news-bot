@@ -4,6 +4,8 @@ import re
 import unicodedata
 from collections import defaultdict
 
+from registry_export import PRODUCT_COLUMN, product_title
+
 
 CATALOG_URL = "https://domis.by/files/prices/all_products.csv"
 TOKEN = re.compile(r"[\w]+(?:[-./][\w]+)*", re.UNICODE)
@@ -11,7 +13,7 @@ LABEL = re.compile(r"\b(?:модел[ьи]|артикул[аы]?)\b\s*[:№]?\s*
 CONFUSABLES = str.maketrans("АВЕКМНОРСТУХ", "ABEKMHOPCTYX")
 DASHES = str.maketrans("‐‑‒–—−", "------")
 REGISTRY_FIELDS = (
-    "Номер записи", "Запись реестра", "Мера", "Дата введения меры", "Ссылка на поиск записи",
+    "Номер записи", PRODUCT_COLUMN, "Мера", "Дата введения меры", "Ссылка на поиск записи",
 )
 REPORT_FIELDS = (
     "ID товара domis.by", "Товар domis.by", "Цена в выгрузке", "Совпавшее обозначение",
@@ -64,7 +66,7 @@ def read_catalog(payload):
 
 
 def registry_codes(title):
-    title = normalize(title.partition(". ")[2] or title)
+    title = normalize(title)
     codes = {}
     labels = list(LABEL.finditer(title))
     if labels:
@@ -122,16 +124,21 @@ def compare(registry_csv, catalog_payload):
     products = read_catalog(catalog_payload)
     index = catalog_index(products)
     reader = csv.DictReader(io.StringIO(registry_csv, newline=""), delimiter=";", strict=True)
-    if not set(REGISTRY_FIELDS).issubset(reader.fieldnames or []):
+    columns = set(reader.fieldnames or [])
+    legacy = PRODUCT_COLUMN not in columns
+    fields = (REGISTRY_FIELDS[0], "Запись реестра", *REGISTRY_FIELDS[2:]) if legacy else REGISTRY_FIELDS
+    if not set(fields).issubset(columns):
         raise ValueError("В общем CSV реестра отсутствуют поля для сверки")
     output = io.StringIO(newline="")
     writer = csv.writer(output, delimiter=";")
     writer.writerow(REPORT_FIELDS)
     matches = 0
     for record in reader:
-        values = [record[field] for field in REGISTRY_FIELDS]
+        values = [record[field] for field in fields]
         if None in values or not values[0] or not values[1]:
             raise ValueError("В общем CSV реестра найдена неполная запись")
+        if legacy:
+            values[1] = product_title(values[0], values[1])
         candidates = {}
         for code, label in registry_codes(values[1]).items():
             for product in index.get(code, ()):

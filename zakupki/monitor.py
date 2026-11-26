@@ -920,10 +920,10 @@ def editor_access(options):
             raise EditorConfigError(f"editor_accounts, запись {index}: укажите логин или email.")
         if name in usernames:
             raise EditorConfigError(f"editor_accounts, запись {index}: логин уже встречается в списке.")
-        if (not isinstance(password, str) or not 20 <= len(password) <= 128
+        if (not isinstance(password, str) or not 15 <= len(password) <= 128
                 or not password.isascii() or not password.isprintable()):
             raise EditorConfigError(f"editor_accounts, запись {index}: пароль должен содержать "
-                                    "20–128 печатных ASCII-символов.")
+                                    "15–128 печатных ASCII-символов.")
         usernames.add(name)
         credentials.append(hashlib.sha256(f"{name}:{password}".encode("ascii")).digest())
     return str(address), tuple(credentials)

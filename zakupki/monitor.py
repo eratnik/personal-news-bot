@@ -897,6 +897,10 @@ class EditorHandler(Handler):
         return False
 
 
+class EditorConfigError(ValueError):
+    pass
+
+
 def editor_access(options):
     accounts = options.get("editor_accounts") or []
     proxy = options.get("editor_proxy_ip")
@@ -905,17 +909,21 @@ def editor_access(options):
     try:
         address = ipaddress.IPv4Address(proxy)
     except ValueError:
-        raise ValueError("Set editor_proxy_ip to the HTTPS proxy's IPv4 address.") from None
+        raise EditorConfigError("editor_proxy_ip: укажите IPv4-адрес HTTPS-прокси.") from None
     if address.is_unspecified or address.is_multicast or not accounts:
-        raise ValueError("Set a proxy address and at least one editor account.")
+        raise EditorConfigError("Укажите адрес прокси и хотя бы одну учётную запись редактора.")
     usernames = set()
     credentials = []
-    for account in accounts:
-        name, password = account["username"], account["password"]
-        if not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", name) or name in usernames:
-            raise ValueError("Use unique editor usernames with letters, digits, dots, underscores or hyphens.")
-        if not 20 <= len(password) <= 128 or not password.isascii() or not password.isprintable():
-            raise ValueError("Use editor passwords of 20–128 printable ASCII characters.")
+    for index, account in enumerate(accounts, 1):
+        name, password = account.get("username"), account.get("password")
+        if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9_.@+\-]{1,254}", name):
+            raise EditorConfigError(f"editor_accounts, запись {index}: укажите логин или email.")
+        if name in usernames:
+            raise EditorConfigError(f"editor_accounts, запись {index}: логин уже встречается в списке.")
+        if (not isinstance(password, str) or not 20 <= len(password) <= 128
+                or not password.isascii() or not password.isprintable()):
+            raise EditorConfigError(f"editor_accounts, запись {index}: пароль должен содержать "
+                                    "20–128 печатных ASCII-символов.")
         usernames.add(name)
         credentials.append(hashlib.sha256(f"{name}:{password}".encode("ascii")).digest())
     return str(address), tuple(credentials)
@@ -951,6 +959,8 @@ def main():
                     EditorHandler.proxy_ip, EditorHandler.credentials = access
                     editors = ThreadingHTTPServer((args.bind, EDITOR_PORT), EditorHandler)
                     threading.Thread(target=editors.serve_forever, daemon=True).start()
+            except EditorConfigError as exc:
+                print(f"Вход для коллег отключён. {exc}", flush=True)
             except (ValueError, KeyError, TypeError, OSError) as exc:
                 print(f"Editor access disabled: {type(exc).__name__}. Check app options and port.",
                       flush=True)

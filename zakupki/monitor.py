@@ -80,6 +80,7 @@ def initialize():
             );
             CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS product_names (item TEXT PRIMARY KEY, name TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS watch_notes (item TEXT PRIMARY KEY, note TEXT NOT NULL);
         """)
 
 
@@ -303,15 +304,21 @@ def results(db):
                    'Название не указано') AS name,
           min(CASE WHEN s.id IS NOT NULL AND o.stock>0 THEN o.cost END) AS buy,
           min(CASE WHEN s.id IS NOT NULL AND coalesce(o.stock,0)<=0 THEN o.cost END) AS unavailable_buy,
-          l.title AS manual_market_title
+          l.title AS manual_market_title, coalesce(n.note,'') AS note,
+          (SELECT min(h.cost) FROM offers h JOIN snapshots t ON t.id=h.snapshot
+           JOIN sources hs ON hs.id=h.source
+           WHERE h.item=w.item AND t.captured>=? AND h.stock>0
+           AND hs.role IN ('supplier','unassigned')
+           AND hs.name NOT LIKE 'Парсер%' AND hs.name NOT LIKE 'парсер%') AS low_90
         FROM watch w
         LEFT JOIN offers o ON o.item=w.item AND o.snapshot=(SELECT id FROM recent)
         LEFT JOIN sources s ON s.id=o.source AND s.role IN ('supplier','unassigned')
           AND s.name NOT LIKE 'Парсер%' AND s.name NOT LIKE 'парсер%'
         LEFT JOIN market_links l ON l.item=w.item
         LEFT JOIN product_names p ON p.item=w.item
+        LEFT JOIN watch_notes n ON n.item=w.item
         GROUP BY w.item ORDER BY w.name COLLATE NOCASE
-    """).fetchall()
+    """, (int(time.time()) - 90 * 86400,)).fetchall()
     market = [(row["title"], model_key(row["title"]), row["price"]) for row in db.execute(
         "SELECT title,min(price) AS price FROM market GROUP BY title")]
     prices = {title: price for title, _, price in market}
@@ -329,11 +336,14 @@ def decision(row):
     if row["buy"] is None:
         return "", 0
     if row["target"] and row["buy"] <= row["target"]:
-        return "В пределах закупочного лимита", 1
+        return "Цель достигнута", 1
+    tolerance = int(OPTIONS.get("target_tolerance_percent", 5))
+    if row["target"] and row["buy"] * 100 <= row["target"] * (100 + tolerance):
+        return "Цена близка к цели", 2
     if row["market"] and 100 * (row["market"] - row["buy"]) >= int(
         OPTIONS.get("min_gap_percent", 15)
     ) * row["market"]:
-        return "Разница с ценой конкурента", 2
+        return "Разница с ценой конкурента", 3
     return "", 0
 
 
@@ -468,8 +478,8 @@ def page(query, error=""):
             "%d.%m.%Y %H:%M UTC") if market_checked else "ожидается"
     currency = esc(OPTIONS.get("currency", "BYN"))
     cards = []
-    for row in sorted(rows, key=lambda row: not decision(row)[1]):
-        reason = decision(row)[0]
+    for row in sorted(rows, key=lambda row: decision(row)[1] or 4):
+        reason, signal = decision(row)
         action = form("remove", f'<input type="hidden" name="item" value="{esc(row["item"])}">'
                       '<button class="quiet">Убрать из списка</button>')
         detail = "?" + urllib.parse.urlencode({"item": row["item"]})
@@ -484,10 +494,12 @@ def page(query, error=""):
         if row["market"] is None:
             market = '<span class="sub">Нет актуальной цены</span>' if row["market_title"] else (
                 f'<a href="{esc(detail)}">Выбрать модель</a>')
-        cards.append(f'<tr><td><a href="{esc(detail)}">{esc(row["name"])}</a>'
+        status = f'<span class="signal signal-{signal}">{esc(reason)}</span>' if signal else "—"
+        note = f'<a href="{esc(detail)}#product-details">{esc(row["note"] or "Добавить комментарий")}</a>'
+        cards.append(f'<tr><td><a href="{esc(detail)}#product-details">{esc(row["name"])}</a>'
                      f'{subtitle}</td>'
-                     f'<td>{buy}</td><td>{market}</td>'
-                     f'<td>{amount(row["target"])}</td><td>{esc(reason or "—")}</td><td>{action}</td></tr>')
+                     f'<td>{buy}</td><td>{amount(row["low_90"])}</td><td>{market}</td>'
+                     f'<td>{amount(row["target"])}</td><td>{status}</td><td class="note">{note}</td><td>{action}</td></tr>')
     roles = {"unassigned": "Автоматически", "supplier": "Поставщик", "ignored": "Не учитывать"}
     source_forms = []
     for source in sources:
@@ -532,7 +544,8 @@ def page(query, error=""):
         options = "".join(f'<option value="{esc(row["title"])}"></option>' for row in market_titles)
         edit = form("watch", f'<input type="hidden" name="item" value="{esc(item)}">'
                     f'<label>Название<input name="name" maxlength="120" value="{esc(name)}"></label>'
-                    f'<label>Закупочный лимит<input name="target" inputmode="decimal" value="{target}"></label>'
+                    f'<label>Целевая цена закупки<input name="target" inputmode="decimal" value="{target}"></label>'
+                    f'<label>Комментарий<textarea name="note" maxlength="500" rows="2">{esc(selected["note"])}</textarea></label>'
                     f'<label>Модель у конкурентов<input name="market_title" list="market-titles" value="{title}"></label>'
                     f'<datalist id="market-titles">{options}</datalist>'
                     '<button>Сохранить изменения</button>', "fields")
@@ -548,7 +561,7 @@ def page(query, error=""):
                                f'<td>{esc(row["stock"] if row["stock"] is not None else "—")}</td></tr>'
                                for row in details)
         heading = selected["name"] if selected else (known["name"] if known else f"Товар {item}")
-        history = f'<section><h2>{esc(heading)}</h2>{edit}<h3>История цен</h3><div class="table"><table><thead><tr><th>Минск</th>'
+        history = f'<section id="product-details"><h2>{esc(heading)}</h2>{edit}<h3>История цен</h3><div class="table"><table><thead><tr><th>Минск</th>'
         history += '<th>Источник</th><th>Цена</th><th>Закупка</th><th>Остаток</th></tr></thead>'
         history += f'<tbody>{history_rows}</tbody></table></div></section>'
         if market_rows:
@@ -559,8 +572,9 @@ def page(query, error=""):
                         f'<tbody>{prices}</tbody></table></div></section>')
     sync_button = form("sync", '<button class="quiet">Обновить цены</button>')
     problem = f'<p class="error" role="alert">{esc(error or LAST_ERROR)}</p>' if error or LAST_ERROR else ""
-    table = (f'<div class="table"><table><thead><tr><th>Товар</th><th>Закупка</th><th>Конкуренты</th><th>Лимит</th>'
-             f'<th>Основание</th><th></th></tr></thead><tbody>{"".join(cards)}</tbody></table></div>'
+    table = (f'<div class="table"><table><thead><tr><th>Товар</th><th>Закупка</th>'
+             f'<th>Мин. за 90 дней</th><th>Конкуренты</th><th>Цель</th>'
+             f'<th>Сигнал</th><th>Комментарий</th><th></th></tr></thead><tbody>{"".join(cards)}</tbody></table></div>'
              if cards else '<p>Добавьте первый товар по ID из выгрузки.</p>')
     return f"""<!doctype html><html lang="ru"><meta charset="utf-8">
     <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -573,7 +587,8 @@ def page(query, error=""):
     section,details{{background:white;border:1px solid #dce6e3;border-radius:16px;margin-top:18px;padding:20px}}
     .fields,.source,.search{{display:flex;flex-wrap:wrap;align-items:end;gap:12px}} .source{{padding:12px 0;border-bottom:1px solid #edf1ef}}
     .source label{{flex:1 1 210px}} .fields label{{flex:1 1 155px}} label{{display:block;font-size:14px}}
-    input,select,button{{font:inherit;padding:9px 12px;border:1px solid #a9bcb5;border-radius:8px}}
+    input,select,button,textarea{{font:inherit;padding:9px 12px;border:1px solid #a9bcb5;border-radius:8px}}
+    textarea{{display:block;width:100%;margin-top:5px;resize:vertical}}
     input{{display:block;width:100%;margin-top:5px}} button{{background:#124c3c;color:white;border-color:#124c3c;cursor:pointer}}
     .quiet{{color:#124c3c;background:white;border-color:#a9bcb5}} a{{color:#075840;font-weight:600}}
     .table{{overflow:auto}} table{{border-collapse:collapse;width:100%;text-align:left}}
@@ -581,6 +596,9 @@ def page(query, error=""):
     summary{{cursor:pointer;font-weight:650}} .error{{color:#9b2828}}
     .matches{{list-style:none;padding:0}} .matches li{{display:flex;flex-wrap:wrap;gap:14px;align-items:center;margin:8px 0}}
     .search{{margin-top:16px}}
+    .signal{{display:inline-block;padding:4px 8px;border-radius:6px;background:#e1f2e9;color:#164e38}}
+    .signal-2{{background:#fff0cf;color:#704600}} .signal-3{{background:#e8eff9;color:#234566}}
+    td.note{{white-space:pre-wrap;overflow-wrap:anywhere;min-width:145px;max-width:240px}}
     </style><main><header><div><h1>Монитор закупок</h1><p>ShopManager · {refreshed}<br>
     Конкуренты · {market_time} · {currency}</p></div>{sync_button}</header>
     {problem}<section><h2>Список наблюдения · {len(rows)}</h2>{table}</section>
@@ -626,7 +644,7 @@ class Handler(BaseHTTPRequestHandler):
         data = {}
         try:
             length = int(self.headers.get("Content-Length", "0"))
-            if not 0 < length <= 8192:
+            if not 0 < length <= 16384:
                 self.send_error(413)
                 return
             data = dict(urllib.parse.parse_qsl(self.rfile.read(length).decode(),
@@ -680,6 +698,7 @@ class Handler(BaseHTTPRequestHandler):
             if action == "remove":
                 db.execute("DELETE FROM watch WHERE item=?", (item,))
                 db.execute("DELETE FROM market_links WHERE item=?", (item,))
+                db.execute("DELETE FROM watch_notes WHERE item=?", (item,))
             elif action == "add":
                 existing = db.execute("SELECT name FROM watch WHERE item=?", (item,)).fetchone()
                 if existing:
@@ -693,6 +712,9 @@ class Handler(BaseHTTPRequestHandler):
             elif action == "watch":
                 name = data.get("name", "").strip()
                 target = data.get("target", "").strip()
+                note = data.get("note")
+                if note is not None and len(note.strip()) > 500:
+                    raise FormError("Комментарий должен быть не длиннее 500 символов.")
                 if len(name) > 120 or (target and money(target) is None):
                     raise FormError("Проверьте название и закупочный лимит.")
                 market_title = data.get("market_title")
@@ -708,6 +730,8 @@ class Handler(BaseHTTPRequestHandler):
                     else:
                         db.execute("DELETE FROM market_links WHERE item=?", (item,))
                 db.execute("REPLACE INTO watch VALUES(?,?,?)", (item, name, money(target)))
+                if note is not None:
+                    db.execute("REPLACE INTO watch_notes VALUES(?,?)", (item, note.strip()))
             else:
                 raise ValueError("Unknown action")
 

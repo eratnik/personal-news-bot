@@ -1,5 +1,5 @@
 name: Монитор закупок
-version: "0.1.4"
+version: "0.1.5"
 slug: zakupki
 description: История цен и сводки по закупкам
 arch:
@@ -19,6 +19,7 @@ options:
   digest_days: 3
   history_days: 90
   min_gap_percent: 15
+  target_tolerance_percent: 5
 schema:
   feed_url: password
   competitor_url: password
@@ -28,6 +29,7 @@ schema:
   digest_days: int(1,30)
   history_days: int(7,365)
   min_gap_percent: int(1,99)
+  target_tolerance_percent: int(0,100)
   telegram_token: password?
   telegram_chat: str?
   smtp_host: str?

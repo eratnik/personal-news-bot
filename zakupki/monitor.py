@@ -1,5 +1,3 @@
-import base64
-import binascii
 import csv
 import hashlib
 import html
@@ -23,13 +21,16 @@ from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from email.message import EmailMessage
 from functools import partial
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.cookies import CookieError, SimpleCookie
 from pathlib import Path
 
 LIMIT = 32 * 1024 * 1024
 DATA = Path(os.getenv("DATA_DIR", "/data"))
 TOKEN = secrets.token_urlsafe(32)
-EDITOR_TOKEN = secrets.token_urlsafe(32)
 EDITOR_PORT = 8100
+EDITOR_SESSION = "__Host-purchase_session"
+EDITOR_LOGIN = "__Host-purchase_login"
+EDITOR_SESSION_SECONDS = 12 * 3600
 EDITOR_ACTIONS = frozenset({"add", "watch", "remove", "model_bind", "model_clear", "model_missing"})
 LOCK = threading.Lock()
 OPTIONS = {}
@@ -500,8 +501,8 @@ def model_chooser(selected, models, term, checked, form):
             f'<div class="model-actions">{status}{missing}</div><p><a href="?">Вернуться к списку</a></p></section>')
 
 
-def page(query, error="", addition=None, *, editor=False):
-    render_form = partial(form, token=EDITOR_TOKEN if editor else TOKEN)
+def page(query, error="", addition=None, *, editor=False, csrf_token=TOKEN):
+    render_form = partial(form, token=csrf_token)
     search = query.get("q", [""])[0].strip()[:120]
     item = query.get("item", [""])[0][:120]
     choosing = query.get("choose") == ["1"]
@@ -532,7 +533,7 @@ def page(query, error="", addition=None, *, editor=False):
             JOIN sources s ON s.id=o.source WHERE o.item=? ORDER BY o.snapshot DESC, s.name LIMIT 200
             """, (item,)).fetchall() if item else []
     refreshed = datetime.fromtimestamp(checked, timezone.utc).strftime("%d.%m.%Y %H:%M UTC") if checked else "ожидается"
-    market_time = "укажите ссылку в разделе «Источники данных»"
+    market_time = "источник не настроен" if editor else "укажите ссылку в разделе «Источники данных»"
     if OPTIONS.get("competitor_url"):
         market_time = datetime.fromtimestamp(market_checked, timezone.utc).strftime(
             "%d.%m.%Y %H:%M UTC") if market_checked else "ожидается"
@@ -644,7 +645,8 @@ def page(query, error="", addition=None, *, editor=False):
             history += ('<section><h2>История цен конкурентов</h2><div class="table"><table>'
                         '<thead><tr><th>Минск</th><th>Магазин</th><th>Цена</th></tr></thead>'
                         f'<tbody>{prices}</tbody></table></div></section>')
-    sync_button = "" if editor else render_form("sync", '<button class="quiet">Обновить цены</button>')
+    sync_button = (render_form("logout", '<button class="quiet">Выйти</button>') if editor
+                   else render_form("sync", '<button class="quiet">Обновить цены</button>'))
     chooser = model_chooser(selected, market_models, model_term, market_checked, render_form) if choosing and selected else ""
     administration = "" if editor else (
         f'<section><h2>Источники данных</h2>{settings}</section>'
@@ -729,7 +731,7 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
     def render(self, query, error="", status=200, addition=None):
-        content = page(query, error, addition, editor=self.editor).encode("utf-8")
+        content = page(query, error, addition, editor=self.editor, csrf_token=self.csrf_token).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Cache-Control", "no-store")
@@ -763,6 +765,9 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_error(403)
                 return
             action = data.get("action")
+            if self.editor and action == "logout":
+                self.logout()
+                return
             if self.editor and action not in EDITOR_ACTIONS:
                 self.send_error(403)
                 return
@@ -885,29 +890,116 @@ class Handler(BaseHTTPRequestHandler):
 
 class EditorHandler(Handler):
     editor = True
-    csrf_token = EDITOR_TOKEN
     proxy_ip = None
     credentials = ()
+    sessions = {}
+    session_lock = threading.Lock()
 
-    def verify_request(self):
+    def allowed_proxy(self):
         if self.client_address[0] != self.proxy_ip:
             self.send_error(403)
             return False
-        scheme, _, encoded = self.headers.get("Authorization", "").partition(" ")
-        if scheme.lower() == "basic" and 0 < len(encoded) <= 1024:
-            try:
-                raw = base64.b64decode(encoded, validate=True)
-            except (ValueError, binascii.Error):
-                raw = b""
-            digest = hashlib.sha256(raw).digest()
-            if any(secrets.compare_digest(digest, entry) for entry in self.credentials):
-                return True
-        self.send_response(401)
-        self.send_header("WWW-Authenticate", 'Basic realm="Purchase Watch", charset="UTF-8"')
+        return True
+
+    def cookie(self, name):
+        try:
+            entry = SimpleCookie(self.headers.get("Cookie", "")).get(name)
+        except CookieError:
+            return ""
+        return entry.value if entry else ""
+
+    def set_cookie(self, name, value, age):
+        self.send_header("Set-Cookie", f"{name}={value}; Max-Age={age}; Path=/; Secure; HttpOnly; SameSite=Strict")
+
+    def verify_request(self):
+        if not self.allowed_proxy():
+            return False
+        self.session_id = self.cookie(EDITOR_SESSION)
+        with self.session_lock:
+            session = self.sessions.get(self.session_id)
+        if session and session[0] > time.monotonic():
+            self.csrf_token = session[1]
+            return True
+        if self.command == "GET":
+            self.login_page()
+        else:
+            self.send_error(403)
+        return False
+
+    def login_page(self, error="", status=200):
+        token = secrets.token_urlsafe(32)
+        alert = f'<p role="alert">{esc(error)}</p>' if error else ""
+        content = f"""<!doctype html><html lang="ru"><meta charset="utf-8">
+        <meta name="viewport" content="width=device-width,initial-scale=1">
+        <title>Вход · Монитор закупок</title><style>
+        body{{font:16px system-ui,sans-serif;background:#f1f5f4;color:#182d28;margin:0;padding:24px}}
+        main{{max-width:380px;margin:8vh auto;background:white;padding:24px;border-radius:16px}}
+        label{{display:block;margin:12px 0}} input,button{{box-sizing:border-box;font:inherit;padding:10px}}
+        input{{display:block;width:100%;margin-top:5px}} button{{background:#124c3c;color:white;border:0;border-radius:8px}}
+        </style><main><h1>Монитор закупок</h1>{alert}
+        <form action="?login=1" method="post"><input type="hidden" name="token" value="{token}">
+        <label>Логин<input name="username" autocomplete="username" required maxlength="254"></label>
+        <label>Пароль<input type="password" name="password" autocomplete="current-password" required maxlength="128"></label>
+        <button>Войти</button></form></main></html>""".encode("utf-8")
+        self.send_response(status)
+        self.set_cookie(EDITOR_LOGIN, token, 600)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; "
+                         "form-action 'self'; base-uri 'none'; frame-ancestors 'none'")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(content)))
+        self.end_headers()
+        self.wfile.write(content)
+
+    def do_POST(self):
+        if urllib.parse.urlsplit(self.path).query != "login=1":
+            super().do_POST()
+            return
+        if not self.allowed_proxy():
+            return
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            if not 0 < length <= 4096:
+                raise ValueError
+            data = dict(urllib.parse.parse_qsl(self.rfile.read(length).decode(), max_num_fields=3))
+            token = data.get("token", "").encode()
+            cookie = self.cookie(EDITOR_LOGIN).encode()
+            if not cookie or not secrets.compare_digest(token, cookie):
+                self.login_page("Откройте форму входа заново.", 403)
+                return
+            name = data.get("username", "").strip()
+            password = data.get("password", "")
+            digest = hashlib.sha256(f"{name}:{password}".encode()).digest()
+        except (ValueError, OSError):
+            self.login_page("Проверьте данные и попробуйте снова.", 400)
+            return
+        if not any(secrets.compare_digest(digest, entry) for entry in self.credentials):
+            self.login_page("Неверный логин или пароль.", 401)
+            return
+        session_id = secrets.token_urlsafe(32)
+        now = time.monotonic()
+        old_session_id = self.cookie(EDITOR_SESSION)
+        with self.session_lock:
+            for key, session in list(self.sessions.items()):
+                if session[0] <= now or key == old_session_id:
+                    self.sessions.pop(key)
+            self.sessions[session_id] = (now + EDITOR_SESSION_SECONDS, secrets.token_urlsafe(32))
+        self.redirect_to_main(session_id, EDITOR_SESSION_SECONDS)
+
+    def logout(self):
+        with self.session_lock:
+            self.sessions.pop(self.session_id, None)
+        self.redirect_to_main("", 0)
+
+    def redirect_to_main(self, session_id, age):
+        self.send_response(303)
+        self.set_cookie(EDITOR_SESSION, session_id, age)
+        self.set_cookie(EDITOR_LOGIN, "", 0)
+        self.send_header("Location", "?")
         self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Length", "0")
         self.end_headers()
-        return False
 
 
 class EditorConfigError(ValueError):

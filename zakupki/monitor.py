@@ -70,6 +70,7 @@ def initialize():
             CREATE INDEX IF NOT EXISTS offers_item ON offers(item, snapshot);
             CREATE TABLE IF NOT EXISTS state (key TEXT PRIMARY KEY, value INTEGER);
             CREATE TABLE IF NOT EXISTS market_links (item TEXT PRIMARY KEY, title TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS market_missing (item TEXT PRIMARY KEY);
             CREATE TABLE IF NOT EXISTS market (
                 title TEXT NOT NULL, shop TEXT NOT NULL, price INTEGER,
                 PRIMARY KEY(title,shop)
@@ -305,6 +306,7 @@ def results(db):
           min(CASE WHEN s.id IS NOT NULL AND o.stock>0 THEN o.cost END) AS buy,
           min(CASE WHEN s.id IS NOT NULL AND coalesce(o.stock,0)<=0 THEN o.cost END) AS unavailable_buy,
           l.title AS manual_market_title, coalesce(n.note,'') AS note,
+          missing.item IS NOT NULL AS market_marked_missing,
           (SELECT min(h.cost) FROM offers h JOIN snapshots t ON t.id=h.snapshot
            JOIN sources hs ON hs.id=h.source
            WHERE h.item=w.item AND t.captured>=? AND h.stock>0
@@ -315,6 +317,7 @@ def results(db):
         LEFT JOIN sources s ON s.id=o.source AND s.role IN ('supplier','unassigned')
           AND s.name NOT LIKE 'Парсер%' AND s.name NOT LIKE 'парсер%'
         LEFT JOIN market_links l ON l.item=w.item
+        LEFT JOIN market_missing missing ON missing.item=w.item
         LEFT JOIN product_names p ON p.item=w.item
         LEFT JOIN watch_notes n ON n.item=w.item
         GROUP BY w.item ORDER BY w.name COLLATE NOCASE
@@ -443,17 +446,59 @@ def form(action, body, css=""):
             f'<input type="hidden" name="action" value="{action}">{body}</form>')
 
 
+def model_chooser(selected, models, term, checked):
+    item = esc(selected["item"])
+    hidden = f'<input type="hidden" name="item" value="{item}">'
+    current = selected["market_title"]
+    if current:
+        method = "Ручная привязка" if selected["manual_market_title"] else "Автоматическое совпадение"
+        current_text = f"{method} · {current}"
+    else:
+        current_text = "Нет модели в CSV" if selected["market_marked_missing"] else "Модель не привязана"
+    search = (f'<form method="get" class="search">{hidden}<input type="hidden" name="choose" value="1">'
+              f'<label>Поиск по названию или коду<input name="model_q" value="{esc(term)}" maxlength="120"></label>'
+              '<button>Найти модели</button></form>')
+    key = model_key(term)
+    choices = [row for row in models if key in model_key(row["title"])]
+    if choices:
+        options = []
+        for row in choices:
+            title = esc(row["title"])
+            price = amount(row["price"]) if row["price"] is not None else "Цена не указана"
+            options.append(f'<label class="model-option"><input type="radio" name="market_title" '
+                           f'value="{title}" required><span>{title}</span><span>{price}</span></label>')
+        binding = form("model_bind", hidden + f'<input type="hidden" name="model_q" value="{esc(term)}">'
+                       f'<div class="model-options">{"".join(options)}</div>'
+                       '<button>Привязать</button>')
+    elif not checked:
+        binding = '<p>CSV ещё не загружен. Проверьте источник и нажмите «Обновить цены».</p>'
+    elif not models:
+        binding = '<p>В загруженном CSV нет моделей.</p>'
+    else:
+        binding = '<p>По запросу ничего не найдено.</p>'
+    status = ""
+    if selected["manual_market_title"] or selected["market_marked_missing"]:
+        status = form("model_clear", hidden + '<button class="quiet">Вернуть автоматический выбор</button>')
+    missing = ""
+    if checked and not current and not selected["market_marked_missing"]:
+        missing = form("model_missing", hidden + '<button class="quiet">Отметить отсутствие в CSV</button>')
+    return (f'<section id="market-model"><h2>Выбор модели · {esc(selected["name"])}</h2>'
+            f'<p>ID {item} · {esc(current_text)}</p>{search}{binding}'
+            f'<div class="model-actions">{status}{missing}</div><p><a href="?">Вернуться к списку</a></p></section>')
+
+
 def page(query, error="", addition=None):
     search = query.get("q", [""])[0].strip()[:120]
     item = query.get("item", [""])[0][:120]
     choosing = query.get("choose") == ["1"]
+    model_term = query.get("model_q", [""])[0].strip()[:120]
     with database() as db:
         checked = state(db, "checked")
         market_checked = state(db, "market_checked")
         latest = db.execute("SELECT max(id) FROM snapshots").fetchone()[0]
         rows = results(db)
         selected = next((row for row in rows if row["item"] == item), None)
-        market_titles = db.execute("SELECT DISTINCT title FROM market ORDER BY title").fetchall() if selected else []
+        market_models = db.execute("SELECT title, min(price) AS price FROM market GROUP BY title ORDER BY title").fetchall() if selected and choosing else []
         market_rows = db.execute("""SELECT datetime(observed,'unixepoch','+3 hours') AS stamp,
             shop, price FROM market_history WHERE title=? ORDER BY observed DESC,shop LIMIT 200""",
             (selected["market_title"],)).fetchall() if selected and selected["market_title"] else []
@@ -500,11 +545,16 @@ def page(query, error="", addition=None):
             buy = amount(row["unavailable_buy"]) + '<span class="sub">Остаток не подтверждён</span>'
         elif row["buy"] is None:
             buy = '<span class="sub">Нет закупочной цены</span>'
-        market = amount(row["market"])
-        if row["market"] is None:
-            choose_link = esc(detail + "&choose=1#market-model")
-            market = '<span class="sub">Нет актуальной цены</span>' if row["market_title"] else (
-                f'<a href="{choose_link}">Выбрать модель</a>')
+        choose_link = esc(detail + "&choose=1#market-model")
+        market = ""
+        if row["market"] is not None:
+            market = amount(row["market"])
+        elif row["market_title"]:
+            market = '<span class="sub">Нет актуальной цены</span>'
+        elif row["market_marked_missing"]:
+            market = '<span class="sub">Нет модели в CSV</span>'
+        choose_label = "Изменить модель" if row["market_title"] else "Выбрать модель"
+        market += f'<a class="sub" href="{choose_link}">{choose_label}</a>'
         status = f'<span class="signal signal-{signal}">{esc(reason)}</span>' if signal else "—"
         note = f'<a href="{esc(detail)}#product-details">{esc(row["note"] or "Добавить комментарий")}</a>'
         cards.append(f'<tr><td><a href="{esc(detail)}#product-details">{esc(row["name"])}</a>'
@@ -552,32 +602,14 @@ def page(query, error="", addition=None):
         name = selected["custom_name"]
         if name == f"ID {item}":
             name = ""
-        title = esc(selected["manual_market_title"] or "")
-        detected = selected["market_title"] if not title else ""
-        options = "".join(f'<option value="{esc(row["title"])}">{esc(row["title"])}</option>'
-                          for row in market_titles)
-        if market_titles:
-            autofocus = " autofocus" if choosing else ""
-            market_field = (f'<label>Модель у конкурентов<input id="market-model" name="market_title" '
-                            f'list="market-titles" value="{title}" placeholder="Начните вводить код модели"'
-                            f' autocomplete="off"{autofocus}></label>'
-                            f'<datalist id="market-titles">{options}</datalist>')
-            market_hint = "Начните вводить код модели, выберите точное совпадение из CSV и сохраните."
-        else:
-            market_field = ""
-            market_hint = "Список моделей пока пуст. Проверьте ссылку на CSV и нажмите «Обновить цены»."
-        keep_chooser = '<input type="hidden" name="choose" value="1">' if choosing else ""
         edit = form("watch", f'<input type="hidden" name="item" value="{esc(item)}">'
-                    f'{keep_chooser}'
                     f'<label>Название<input name="name" maxlength="120" value="{esc(name)}"></label>'
                     f'<label>Целевая цена закупки<input name="target" inputmode="decimal" value="{target}"></label>'
                     f'<label>Комментарий<textarea name="note" maxlength="500" rows="2">{esc(selected["note"])}</textarea></label>'
-                    f'{market_field}'
                     '<button>Сохранить изменения</button>', "fields")
-        if choosing:
-            edit = f'<p>{market_hint} Если модели в CSV нет, оставьте поле пустым.</p>{edit}'
-        if detected:
-            edit += f'<p>Найдена в CSV по названию товара · {esc(detected)}</p>'
+        model_link = esc("?" + urllib.parse.urlencode({"item": item, "choose": "1"}) + "#market-model")
+        model_title = esc(selected["market_title"] or "Модель не привязана")
+        edit += f'<p>Модель у конкурентов · {model_title} <a href="{model_link}">Настроить привязку</a></p>'
     elif item:
         edit = form("add", f'<input type="hidden" name="item" value="{esc(item)}">'
                     f'{"" if known else name_input}<button>Добавить к отслеживанию</button>', "fields")
@@ -588,7 +620,6 @@ def page(query, error="", addition=None):
                                f'<td>{esc(row["stock"] if row["stock"] is not None else "—")}</td></tr>'
                                for row in details)
         heading = selected["name"] if selected else (known["name"] if known else f"Товар {item}")
-        heading = f"Выбор модели · {heading}" if choosing and selected else heading
         history = f'<section id="product-details"><h2>{esc(heading)}</h2>{edit}<h3>История цен</h3><div class="table"><table><thead><tr><th>Минск</th>'
         history += '<th>Источник</th><th>Цена</th><th>Закупка</th><th>Остаток</th></tr></thead>'
         history += f'<tbody>{history_rows}</tbody></table></div></section>'
@@ -599,6 +630,7 @@ def page(query, error="", addition=None):
                         '<thead><tr><th>Минск</th><th>Магазин</th><th>Цена</th></tr></thead>'
                         f'<tbody>{prices}</tbody></table></div></section>')
     sync_button = form("sync", '<button class="quiet">Обновить цены</button>')
+    chooser = model_chooser(selected, market_models, model_term, market_checked) if choosing and selected else ""
     add_error = error if query.get("add_error") else ""
     problem_text = (error if not add_error else "") or LAST_ERROR
     problem = f'<p class="error" role="alert">{esc(problem_text)}</p>' if problem_text else ""
@@ -631,9 +663,14 @@ def page(query, error="", addition=None):
     .signal{{display:inline-block;padding:4px 8px;border-radius:6px;background:#e1f2e9;color:#164e38}}
     .signal-2{{background:#fff0cf;color:#704600}} .signal-3{{background:#e8eff9;color:#234566}}
     td.note{{white-space:pre-wrap;overflow-wrap:anywhere;min-width:145px;max-width:240px}}
-    </style><main><header><div><h1>Монитор закупок</h1><p>ShopManager · {refreshed}<br>
+    h1 a{{color:inherit;text-decoration:none;font-weight:inherit}} h1 a:hover{{text-decoration:underline}}
+    .model-options{{margin:14px 0;max-height:24rem;overflow:auto;border:1px solid #dce6e3}}
+    .model-option{{display:grid;grid-template-columns:auto 1fr auto;gap:12px;align-items:center;
+      padding:10px;border-bottom:1px solid #edf1ef;cursor:pointer}}
+    .model-option input{{width:auto;margin:0}} .model-actions{{display:flex;flex-wrap:wrap;gap:12px;margin-top:12px}}
+    </style><main><header><div><h1><a href="?">Монитор закупок</a></h1><p>ShopManager · {refreshed}<br>
     Конкуренты · {market_time} · {currency}</p></div>{sync_button}</header>
-    {problem}{history if choosing else ""}<section><h2>Список наблюдения · {len(rows)}</h2>{table}</section>
+    {problem}{chooser}<section><h2>Список наблюдения · {len(rows)}</h2>{table}</section>
     <section><h2>Добавить товар</h2>{add_feedback}{form_problem}
     <p>Если название есть в каталоге, достаточно ID. Для остальных товаров укажите название при добавлении.</p>
     {add}
@@ -699,10 +736,10 @@ class Handler(BaseHTTPRequestHandler):
                 query = {"q": [data["q"]]} if data.get("q") else {}
                 self.render(query, addition=(data["item"].strip(), created))
             elif action == "watch":
-                query = {"item": [data["item"].strip()]}
-                if data.get("choose") == "1":
-                    query["choose"] = ["1"]
-                self.render(query)
+                self.render({"item": [data["item"].strip()]})
+            elif action in {"model_bind", "model_clear", "model_missing"}:
+                self.render({"item": [data["item"].strip()], "choose": ["1"],
+                             "model_q": [data.get("model_q", "")]})
             else:
                 self.render({})
         except FormError as exc:
@@ -716,8 +753,9 @@ class Handler(BaseHTTPRequestHandler):
                 query["add_name"] = [data.get("name", "")]
             elif data.get("item"):
                 query["item"] = [data["item"]]
-                if data.get("choose") == "1":
+                if data.get("action") in {"model_bind", "model_clear", "model_missing"}:
                     query["choose"] = ["1"]
+                    query["model_q"] = [data.get("model_q", "")]
             self.render(query, str(exc), 400)
         except (ValueError, KeyError, sqlite3.Error, OSError) as exc:
             self.render({}, f"Операция не выполнена ({type(exc).__name__}).", 400)
@@ -739,6 +777,7 @@ class Handler(BaseHTTPRequestHandler):
             if action == "remove":
                 db.execute("DELETE FROM watch WHERE item=?", (item,))
                 db.execute("DELETE FROM market_links WHERE item=?", (item,))
+                db.execute("DELETE FROM market_missing WHERE item=?", (item,))
                 db.execute("DELETE FROM watch_notes WHERE item=?", (item,))
             elif action == "add":
                 existing = db.execute("SELECT name FROM watch WHERE item=?", (item,)).fetchone()
@@ -750,6 +789,21 @@ class Handler(BaseHTTPRequestHandler):
                 if not name and not db.execute("SELECT 1 FROM product_names WHERE item=?", (item,)).fetchone():
                     raise FormError("Для этого ID нет названия в каталоге. Введите название товара.")
                 return db.execute("INSERT OR IGNORE INTO watch VALUES(?,?,NULL)", (item, name)).rowcount == 1
+            elif action in {"model_bind", "model_clear", "model_missing"}:
+                if not db.execute("SELECT 1 FROM watch WHERE item=?", (item,)).fetchone():
+                    raise FormError("Сначала добавьте товар к отслеживанию.")
+                if action == "model_bind":
+                    title = data.get("market_title", "")
+                    if not db.execute("SELECT 1 FROM market WHERE title=?", (title,)).fetchone():
+                        raise FormError("Выберите строку из текущей выгрузки CSV.")
+                    db.execute("REPLACE INTO market_links VALUES(?,?)", (item, title))
+                    db.execute("DELETE FROM market_missing WHERE item=?", (item,))
+                else:
+                    db.execute("DELETE FROM market_links WHERE item=?", (item,))
+                    if action == "model_missing":
+                        db.execute("INSERT OR IGNORE INTO market_missing VALUES(?)", (item,))
+                    else:
+                        db.execute("DELETE FROM market_missing WHERE item=?", (item,))
             elif action == "watch":
                 name = data.get("name", "").strip()
                 target = data.get("target", "").strip()
@@ -758,18 +812,6 @@ class Handler(BaseHTTPRequestHandler):
                     raise FormError("Комментарий должен быть не длиннее 500 символов.")
                 if len(name) > 120 or (target and money(target) is None):
                     raise FormError("Проверьте название и закупочный лимит.")
-                market_title = data.get("market_title")
-                if market_title is not None:
-                    market_title = market_title.strip()
-                    if market_title:
-                        match = db.execute("""SELECT title FROM market WHERE title=?
-                            UNION SELECT title FROM market_links WHERE item=? AND title=?""",
-                            (market_title, item, market_title)).fetchone()
-                        if not match:
-                            raise FormError("Выберите точное название модели из списка конкурентов.")
-                        db.execute("REPLACE INTO market_links VALUES(?,?)", (item, market_title))
-                    else:
-                        db.execute("DELETE FROM market_links WHERE item=?", (item,))
                 db.execute("REPLACE INTO watch VALUES(?,?,?)", (item, name, money(target)))
                 if note is not None:
                     db.execute("REPLACE INTO watch_notes VALUES(?,?)", (item, note.strip()))

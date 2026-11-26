@@ -1,7 +1,10 @@
+import base64
+import binascii
 import csv
 import hashlib
 import html
 import io
+import ipaddress
 import json
 import os
 import re
@@ -18,12 +21,16 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from email.message import EmailMessage
+from functools import partial
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 LIMIT = 32 * 1024 * 1024
 DATA = Path(os.getenv("DATA_DIR", "/data"))
 TOKEN = secrets.token_urlsafe(32)
+EDITOR_TOKEN = secrets.token_urlsafe(32)
+EDITOR_PORT = 8100
+EDITOR_ACTIONS = frozenset({"add", "watch", "remove", "model_bind", "model_clear", "model_missing"})
 LOCK = threading.Lock()
 OPTIONS = {}
 LAST_ERROR = ""
@@ -447,12 +454,12 @@ def esc(value):
     return html.escape(str(value), quote=True)
 
 
-def form(action, body, css=""):
-    return (f'<form method="post" class="{css}"><input type="hidden" name="token" value="{TOKEN}">'
+def form(action, body, css="", *, token=TOKEN):
+    return (f'<form method="post" class="{css}"><input type="hidden" name="token" value="{token}">'
             f'<input type="hidden" name="action" value="{action}">{body}</form>')
 
 
-def model_chooser(selected, models, term, checked):
+def model_chooser(selected, models, term, checked, form):
     item = esc(selected["item"])
     hidden = f'<input type="hidden" name="item" value="{item}">'
     current = selected["market_title"]
@@ -493,7 +500,8 @@ def model_chooser(selected, models, term, checked):
             f'<div class="model-actions">{status}{missing}</div><p><a href="?">Вернуться к списку</a></p></section>')
 
 
-def page(query, error="", addition=None):
+def page(query, error="", addition=None, *, editor=False):
+    render_form = partial(form, token=EDITOR_TOKEN if editor else TOKEN)
     search = query.get("q", [""])[0].strip()[:120]
     item = query.get("item", [""])[0][:120]
     choosing = query.get("choose") == ["1"]
@@ -518,7 +526,7 @@ def page(query, error="", addition=None):
         ORDER BY c.item<>?, c.item LIMIT 20
         """, (latest, search, search, search, search, search)).fetchall() if search else []
         known = db.execute("SELECT name FROM product_names WHERE item=?", (item,)).fetchone() if item else None
-        sources = db.execute("SELECT * FROM sources ORDER BY name").fetchall()
+        sources = [] if editor else db.execute("SELECT * FROM sources ORDER BY name").fetchall()
         details = db.execute("""SELECT datetime(t.captured,'unixepoch','+3 hours') AS stamp,
             s.name, o.retail, o.cost, o.stock FROM offers o JOIN snapshots t ON t.id=o.snapshot
             JOIN sources s ON s.id=o.source WHERE o.item=? ORDER BY o.snapshot DESC, s.name LIMIT 200
@@ -541,7 +549,7 @@ def page(query, error="", addition=None):
     cards = []
     for row in sorted(rows, key=lambda row: decision(row)[1] or 4):
         reason, signal = decision(row)
-        action = form("remove", f'<input type="hidden" name="item" value="{esc(row["item"])}">'
+        action = render_form("remove", f'<input type="hidden" name="item" value="{esc(row["item"])}">'
                       '<button class="quiet">Убрать из списка</button>')
         detail = "?" + urllib.parse.urlencode({"item": row["item"]})
         identifier = f'ID {row["item"]}'
@@ -575,7 +583,7 @@ def page(query, error="", addition=None):
         role = "ignored" if source["role"] == "competitor" else source["role"]
         choices = "".join(f'<option value="{key}" {"selected" if key == role else ""}>{label}</option>'
                           for key, label in roles.items())
-        source_forms.append(form("role",
+        source_forms.append(render_form("role",
             f'<input type="hidden" name="source" value="{esc(source["id"])}">'
             f'<label>{esc(source["name"])}<span class="sub">ID {esc(source["id"])}</span></label>'
             f'<select name="role" aria-label="Роль источника">{choices}</select><button>Сохранить</button>', "source"))
@@ -585,17 +593,17 @@ def page(query, error="", addition=None):
     for row in found:
         found_id = row["item"]
         link = "?" + urllib.parse.urlencode({"item": found_id})
-        control = ('<span class="sub">В списке наблюдения</span>' if found_id in watched else form(
+        control = ('<span class="sub">В списке наблюдения</span>' if found_id in watched else render_form(
             "add", f'<input type="hidden" name="item" value="{esc(found_id)}">'
             f'<input type="hidden" name="q" value="{esc(search)}">'
             f'{"" if row["name"] else name_input}<button>Добавить к отслеживанию</button>', "fields"))
         caption = f'{row["name"]} · ID {found_id}' if row["name"] else f'ID {found_id}'
         search_results.append(f'<li><a href="{esc(link)}">{esc(caption)}</a>{control}</li>')
     input_name = esc(query.get("add_name", [""])[0])
-    add = form("add", f'<label>ID товара<input name="item" required maxlength="120" autocomplete="off" value="{esc(query.get("add_id", [""])[0])}"></label>'
+    add = render_form("add", f'<label>ID товара<input name="item" required maxlength="120" autocomplete="off" value="{esc(query.get("add_id", [""])[0])}"></label>'
                f'<label>Название товара<input name="name" maxlength="120" value="{input_name}"></label>'
                '<button>Добавить по ID</button>', "fields")
-    settings = form("settings",
+    settings = "" if editor else render_form("settings",
         f'<label>Ссылка на CSV конкурентов<input type="password" autocomplete="off" name="competitor_url" '
         f'value="{esc(OPTIONS.get("competitor_url") or "")}"></label>'
         f'<label>Ссылка на каталог названий (JSON или YML)<input type="password" autocomplete="off" name="catalog_url" '
@@ -607,7 +615,7 @@ def page(query, error="", addition=None):
         name = selected["custom_name"]
         if name == f"ID {item}":
             name = ""
-        edit = form("watch", f'<input type="hidden" name="item" value="{esc(item)}">'
+        edit = render_form("watch", f'<input type="hidden" name="item" value="{esc(item)}">'
                     f'<label>Название<input name="name" maxlength="120" value="{esc(name)}"></label>'
                     f'<label>Целевая цена закупки<input name="target" inputmode="decimal" value="{target}"></label>'
                     f'<label>Комментарий<textarea name="note" maxlength="500" rows="2">{esc(selected["note"])}</textarea></label>'
@@ -618,7 +626,7 @@ def page(query, error="", addition=None):
         model_action = "Изменить модель конкурента" if selected["market_title"] else "Выбрать модель конкурента"
         edit += f'<p>Модель у конкурентов · {esc(model_title)} <a href="{model_link}">{model_action}</a></p>'
     elif item:
-        edit = form("add", f'<input type="hidden" name="item" value="{esc(item)}">'
+        edit = render_form("add", f'<input type="hidden" name="item" value="{esc(item)}">'
                     f'{"" if known else name_input}<button>Добавить к отслеживанию</button>', "fields")
     history = ""
     if item:
@@ -636,8 +644,13 @@ def page(query, error="", addition=None):
             history += ('<section><h2>История цен конкурентов</h2><div class="table"><table>'
                         '<thead><tr><th>Минск</th><th>Магазин</th><th>Цена</th></tr></thead>'
                         f'<tbody>{prices}</tbody></table></div></section>')
-    sync_button = form("sync", '<button class="quiet">Обновить цены</button>')
-    chooser = model_chooser(selected, market_models, model_term, market_checked) if choosing and selected else ""
+    sync_button = "" if editor else render_form("sync", '<button class="quiet">Обновить цены</button>')
+    chooser = model_chooser(selected, market_models, model_term, market_checked, render_form) if choosing and selected else ""
+    administration = "" if editor else (
+        f'<section><h2>Источники данных</h2>{settings}</section>'
+        f'<details><summary>Роли источников · {len(sources)}</summary>'
+        f'<p>Оптовые цены ShopManager учитываются автоматически. Ненужный прайс можно исключить.</p>'
+        f'{"".join(source_forms)}</details>')
     add_error = error if query.get("add_error") else ""
     problem_text = (error if not add_error else "") or LAST_ERROR
     problem = f'<p class="error" role="alert">{esc(problem_text)}</p>' if problem_text else ""
@@ -685,13 +698,14 @@ def page(query, error="", addition=None):
     <form method="get" class="search"><label>Поиск ID в последней выгрузке<input name="q" value="{esc(search)}"></label>
     <button class="quiet">Найти</button></form>
     {"<ul class='matches'>" + "".join(search_results) + "</ul>" if search_results else ("<p>Совпадений нет</p>" if search else "")}</section>
-    {history if not choosing else ""}<section><h2>Источники данных</h2>{settings}</section>
-    <details><summary>Роли источников · {len(sources)}</summary>
-    <p>Оптовые цены ShopManager учитываются автоматически. Ненужный прайс можно исключить.</p>{"".join(source_forms)}</details>
+    {history if not choosing else ""}{administration}
     </main></html>"""
 
 
 class Handler(BaseHTTPRequestHandler):
+    editor = False
+    csrf_token = TOKEN
+
     def verify_request(self):
         if os.getenv("HA_INGRESS") == "1" and self.client_address[0] != "172.30.32.2":
             self.send_error(403)
@@ -702,10 +716,15 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
     def render(self, query, error="", status=200, addition=None):
-        content = page(query, error, addition).encode("utf-8")
+        content = page(query, error, addition, editor=self.editor).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
+        if self.editor:
+            self.send_header("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; "
+                             "form-action 'self'; base-uri 'none'; frame-ancestors 'none'")
         self.send_header("Content-Length", str(len(content)))
         self.end_headers()
         self.wfile.write(content)
@@ -726,10 +745,14 @@ class Handler(BaseHTTPRequestHandler):
                 return
             data = dict(urllib.parse.parse_qsl(self.rfile.read(length).decode(),
                                              keep_blank_values=True, max_num_fields=10))
-            if not secrets.compare_digest(data.get("token", ""), TOKEN):
+            token = data.get("token", "").encode("utf-8")
+            if not secrets.compare_digest(token, self.csrf_token.encode("ascii")):
                 self.send_error(403)
                 return
             action = data.get("action")
+            if self.editor and action not in EDITOR_ACTIONS:
+                self.send_error(403)
+                return
             if action == "sync":
                 if not LOCK.acquire(blocking=False):
                     self.render({}, "Уже выполняется фоновая задача.", 409)
@@ -847,6 +870,57 @@ class Handler(BaseHTTPRequestHandler):
             OPTIONS.update(values)
 
 
+class EditorHandler(Handler):
+    editor = True
+    csrf_token = EDITOR_TOKEN
+    proxy_ip = None
+    credentials = ()
+
+    def verify_request(self):
+        if self.client_address[0] != self.proxy_ip:
+            self.send_error(403)
+            return False
+        scheme, _, encoded = self.headers.get("Authorization", "").partition(" ")
+        if scheme.lower() == "basic" and 0 < len(encoded) <= 1024:
+            try:
+                raw = base64.b64decode(encoded, validate=True)
+            except (ValueError, binascii.Error):
+                raw = b""
+            digest = hashlib.sha256(raw).digest()
+            if any(secrets.compare_digest(digest, entry) for entry in self.credentials):
+                return True
+        self.send_response(401)
+        self.send_header("WWW-Authenticate", 'Basic realm="Purchase Watch", charset="UTF-8"')
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+        return False
+
+
+def editor_access(options):
+    accounts = options.get("editor_accounts") or []
+    proxy = options.get("editor_proxy_ip")
+    if not accounts and not proxy:
+        return None
+    try:
+        address = ipaddress.IPv4Address(proxy)
+    except ValueError:
+        raise ValueError("Set editor_proxy_ip to the HTTPS proxy's IPv4 address.") from None
+    if address.is_unspecified or address.is_multicast or not accounts:
+        raise ValueError("Set a proxy address and at least one editor account.")
+    usernames = set()
+    credentials = []
+    for account in accounts:
+        name, password = account["username"], account["password"]
+        if not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", name) or name in usernames:
+            raise ValueError("Use unique editor usernames with letters, digits, dots, underscores or hyphens.")
+        if not 20 <= len(password) <= 128 or not password.isascii() or not password.isprintable():
+            raise ValueError("Use editor passwords of 20–128 printable ASCII characters.")
+        usernames.add(name)
+        credentials.append(hashlib.sha256(f"{name}:{password}".encode("ascii")).digest())
+    return str(address), tuple(credentials)
+
+
 def main():
     global OPTIONS
     import argparse
@@ -869,7 +943,18 @@ def main():
     if args.bind != "127.0.0.1" and os.getenv("HA_INGRESS") != "1":
         parser.error("Non-local binding is reserved for Home Assistant Ingress")
     threading.Thread(target=worker, daemon=True).start()
-    ThreadingHTTPServer((args.bind, args.port), Handler).serve_forever()
+    with ThreadingHTTPServer((args.bind, args.port), Handler) as server:
+        if os.getenv("HA_INGRESS") == "1":
+            try:
+                access = editor_access(OPTIONS)
+                if access:
+                    EditorHandler.proxy_ip, EditorHandler.credentials = access
+                    editors = ThreadingHTTPServer((args.bind, EDITOR_PORT), EditorHandler)
+                    threading.Thread(target=editors.serve_forever, daemon=True).start()
+            except (ValueError, KeyError, TypeError, OSError) as exc:
+                print(f"Editor access disabled: {type(exc).__name__}. Check app options and port.",
+                      flush=True)
+        server.serve_forever()
 
 
 if __name__ == "__main__":

@@ -1,11 +1,15 @@
 name: Монитор закупок
-version: "0.1.9"
+version: "0.1.10"
 slug: zakupki
 description: История цен и сводки по закупкам
 arch:
   - amd64
 ingress: true
 ingress_port: 8099
+ports:
+  8100/tcp: null
+ports_description:
+  8100/tcp: Вход для коллег через HTTPS-прокси
 panel_icon: mdi:clipboard-list-outline
 startup: application
 boot: auto
@@ -20,6 +24,7 @@ options:
   history_days: 90
   min_gap_percent: 15
   target_tolerance_percent: 5
+  editor_accounts: []
 schema:
   feed_url: password
   competitor_url: password
@@ -38,3 +43,7 @@ schema:
   smtp_password: password?
   email_from: email?
   email_to: email?
+  editor_proxy_ip: str?
+  editor_accounts:
+    - username: str
+      password: password

@@ -550,7 +550,7 @@ def page(query, error="", addition=None, *, editor=False):
     for row in sorted(rows, key=lambda row: decision(row)[1] or 4):
         reason, signal = decision(row)
         action = render_form("remove", f'<input type="hidden" name="item" value="{esc(row["item"])}">'
-                      '<button class="quiet">Убрать из списка</button>')
+                      f'<button class="quiet" aria-label="Убрать из списка: {esc(row["name"])}">Убрать</button>')
         detail = "?" + urllib.parse.urlencode({"item": row["item"]})
         identifier = f'ID {row["item"]}'
         subtitle = f'<span class="sub">{esc(identifier)}</span>'
@@ -655,15 +655,16 @@ def page(query, error="", addition=None, *, editor=False):
     problem_text = (error if not add_error else "") or LAST_ERROR
     problem = f'<p class="error" role="alert">{esc(problem_text)}</p>' if problem_text else ""
     form_problem = f'<p class="error" role="alert">{esc(add_error)}</p>' if add_error else ""
-    table = (f'<div class="table"><table><thead><tr><th>Товар</th><th>Закупка</th>'
+    table = (f'<div class="table" role="region" aria-label="Список наблюдения" tabindex="0">'
+             f'<table class="watch-table"><thead><tr><th>Товар</th><th>Закупка</th>'
              f'<th>Мин. за 90 дней</th><th>Конкуренты</th><th>Цель</th>'
-             f'<th>Сигнал</th><th>Комментарий</th><th></th></tr></thead><tbody>{"".join(cards)}</tbody></table></div>'
+             f'<th>Сигнал</th><th>Комментарий</th><th aria-label="Действия"></th></tr></thead><tbody>{"".join(cards)}</tbody></table></div>'
              if cards else '<p>Добавьте первый товар по ID из выгрузки.</p>')
     return f"""<!doctype html><html lang="ru"><meta charset="utf-8">
     <meta name="viewport" content="width=device-width,initial-scale=1">
     <title>Монитор закупок</title><style>
     *{{box-sizing:border-box}} body{{margin:0;background:#f1f5f4;color:#182d28;font:16px system-ui,sans-serif}}
-    main{{max-width:1180px;margin:auto;padding:clamp(16px,4vw,48px)}}
+    main{{max-width:1840px;margin:auto;padding:clamp(12px,2vw,32px)}}
     header{{display:flex;justify-content:space-between;align-items:center;gap:16px;flex-wrap:wrap}}
     h1{{font-size:clamp(30px,5vw,48px);margin:0;letter-spacing:-.045em}} h2{{margin:0 0 16px;font-size:21px}}
     p{{line-height:1.5}} header p,.sub{{color:#526761}} .sub{{display:block;font-size:14px}}
@@ -682,8 +683,20 @@ def page(query, error="", addition=None, *, editor=False):
     .add-feedback{{padding:10px 12px;background:#e1f2e9;border-radius:8px}}
     .signal{{display:inline-block;padding:4px 8px;border-radius:6px;background:#e1f2e9;color:#164e38}}
     .signal-2{{background:#fff0cf;color:#704600}} .signal-3{{background:#e8eff9;color:#234566}}
-    td.note{{white-space:pre-wrap;overflow-wrap:anywhere;min-width:145px;max-width:240px}}
-    .market-shops{{white-space:normal;overflow-wrap:anywhere;max-width:190px}}
+    .watch-table{{min-width:800px;table-layout:fixed;font-variant-numeric:tabular-nums}}
+    .watch-table th,.watch-table td{{padding:10px 8px;white-space:normal;overflow-wrap:anywhere;vertical-align:middle}}
+    .watch-table th:nth-child(1){{width:20%}}
+    .watch-table th:nth-child(2){{width:11%}}
+    .watch-table th:nth-child(3){{width:10%}}
+    .watch-table th:nth-child(4){{width:14%}}
+    .watch-table th:nth-child(5){{width:8%}}
+    .watch-table th:nth-child(6){{width:14%}}
+    .watch-table th:nth-child(7){{width:15%}}
+    .watch-table th:nth-child(8){{width:8%}}
+    .watch-table tr:hover td{{background:#f7faf9}}
+    .watch-table td.note{{white-space:pre-wrap}}
+    .watch-table td:last-child button{{padding:5px 6px;font-size:14px}}
+    @media(max-width:600px){{section,details{{padding:12px}}}}
     h1 a{{color:inherit;text-decoration:none;font-weight:inherit}} h1 a:hover{{text-decoration:underline}}
     .model-options{{margin:14px 0;max-height:24rem;overflow:auto;border:1px solid #dce6e3}}
     .model-option{{display:grid;grid-template-columns:auto 1fr auto;gap:12px;align-items:center;

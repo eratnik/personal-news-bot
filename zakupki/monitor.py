@@ -325,12 +325,18 @@ def results(db):
     market = [(row["title"], model_key(row["title"]), row["price"]) for row in db.execute(
         "SELECT title,min(price) AS price FROM market GROUP BY title")]
     prices = {title: price for title, _, price in market}
+    cheapest_shops = {}
+    if fresh:
+        for offer in db.execute("SELECT title,shop,price FROM market WHERE price IS NOT NULL ORDER BY shop"):
+            if offer["price"] == prices[offer["title"]]:
+                cheapest_shops.setdefault(offer["title"], []).append(offer["shop"])
     results = []
     for row in rows:
         entry = dict(row)
         title = row["manual_market_title"] or match_model(row["name"], market)
         entry["market_title"] = title
         entry["market"] = prices.get(title) if fresh else None
+        entry["market_shops"] = cheapest_shops.get(title, [])
         results.append(entry)
     return results
 
@@ -545,16 +551,15 @@ def page(query, error="", addition=None):
             buy = amount(row["unavailable_buy"]) + '<span class="sub">Остаток не подтверждён</span>'
         elif row["buy"] is None:
             buy = '<span class="sub">Нет закупочной цены</span>'
-        choose_link = esc(detail + "&choose=1#market-model")
-        market = ""
         if row["market"] is not None:
-            market = amount(row["market"])
+            shops = esc(", ".join(row["market_shops"]))
+            market = f'{amount(row["market"])}<span class="sub market-shops">{shops}</span>'
         elif row["market_title"]:
             market = '<span class="sub">Нет актуальной цены</span>'
         elif row["market_marked_missing"]:
             market = '<span class="sub">Нет модели в CSV</span>'
-        choose_label = "Изменить модель" if row["market_title"] else "Выбрать модель"
-        market += f'<a class="sub" href="{choose_link}">{choose_label}</a>'
+        else:
+            market = '<span class="sub">Модель не привязана</span>'
         status = f'<span class="signal signal-{signal}">{esc(reason)}</span>' if signal else "—"
         note = f'<a href="{esc(detail)}#product-details">{esc(row["note"] or "Добавить комментарий")}</a>'
         cards.append(f'<tr><td><a href="{esc(detail)}#product-details">{esc(row["name"])}</a>'
@@ -608,8 +613,10 @@ def page(query, error="", addition=None):
                     f'<label>Комментарий<textarea name="note" maxlength="500" rows="2">{esc(selected["note"])}</textarea></label>'
                     '<button>Сохранить изменения</button>', "fields")
         model_link = esc("?" + urllib.parse.urlencode({"item": item, "choose": "1"}) + "#market-model")
-        model_title = esc(selected["market_title"] or "Модель не привязана")
-        edit += f'<p>Модель у конкурентов · {model_title} <a href="{model_link}">Настроить привязку</a></p>'
+        model_title = selected["market_title"] or (
+            "Нет модели в CSV" if selected["market_marked_missing"] else "Модель не привязана")
+        model_action = "Изменить модель конкурента" if selected["market_title"] else "Выбрать модель конкурента"
+        edit += f'<p>Модель у конкурентов · {esc(model_title)} <a href="{model_link}">{model_action}</a></p>'
     elif item:
         edit = form("add", f'<input type="hidden" name="item" value="{esc(item)}">'
                     f'{"" if known else name_input}<button>Добавить к отслеживанию</button>', "fields")
@@ -663,6 +670,7 @@ def page(query, error="", addition=None):
     .signal{{display:inline-block;padding:4px 8px;border-radius:6px;background:#e1f2e9;color:#164e38}}
     .signal-2{{background:#fff0cf;color:#704600}} .signal-3{{background:#e8eff9;color:#234566}}
     td.note{{white-space:pre-wrap;overflow-wrap:anywhere;min-width:145px;max-width:240px}}
+    .market-shops{{white-space:normal;overflow-wrap:anywhere;max-width:190px}}
     h1 a{{color:inherit;text-decoration:none;font-weight:inherit}} h1 a:hover{{text-decoration:underline}}
     .model-options{{margin:14px 0;max-height:24rem;overflow:auto;border:1px solid #dce6e3}}
     .model-option{{display:grid;grid-template-columns:auto 1fr auto;gap:12px;align-items:center;

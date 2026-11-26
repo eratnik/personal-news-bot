@@ -1,5 +1,5 @@
 name: Монитор закупок
-version: "0.1.6"
+version: "0.1.7"
 slug: zakupki
 description: История цен и сводки по закупкам
 arch:

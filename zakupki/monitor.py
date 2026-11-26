@@ -446,6 +446,7 @@ def form(action, body, css=""):
 def page(query, error="", addition=None):
     search = query.get("q", [""])[0].strip()[:120]
     item = query.get("item", [""])[0][:120]
+    choosing = query.get("choose") == ["1"]
     with database() as db:
         checked = state(db, "checked")
         market_checked = state(db, "market_checked")
@@ -501,8 +502,9 @@ def page(query, error="", addition=None):
             buy = '<span class="sub">Нет закупочной цены</span>'
         market = amount(row["market"])
         if row["market"] is None:
+            choose_link = esc(detail + "&choose=1#market-model")
             market = '<span class="sub">Нет актуальной цены</span>' if row["market_title"] else (
-                f'<a href="{esc(detail)}">Выбрать модель</a>')
+                f'<a href="{choose_link}">Выбрать модель</a>')
         status = f'<span class="signal signal-{signal}">{esc(reason)}</span>' if signal else "—"
         note = f'<a href="{esc(detail)}#product-details">{esc(row["note"] or "Добавить комментарий")}</a>'
         cards.append(f'<tr><td><a href="{esc(detail)}#product-details">{esc(row["name"])}</a>'
@@ -552,14 +554,28 @@ def page(query, error="", addition=None):
             name = ""
         title = esc(selected["manual_market_title"] or "")
         detected = selected["market_title"] if not title else ""
-        options = "".join(f'<option value="{esc(row["title"])}"></option>' for row in market_titles)
+        options = "".join(f'<option value="{esc(row["title"])}">{esc(row["title"])}</option>'
+                          for row in market_titles)
+        if market_titles:
+            autofocus = " autofocus" if choosing else ""
+            market_field = (f'<label>Модель у конкурентов<input id="market-model" name="market_title" '
+                            f'list="market-titles" value="{title}" placeholder="Начните вводить код модели"'
+                            f' autocomplete="off"{autofocus}></label>'
+                            f'<datalist id="market-titles">{options}</datalist>')
+            market_hint = "Начните вводить код модели, выберите точное совпадение из CSV и сохраните."
+        else:
+            market_field = ""
+            market_hint = "Список моделей пока пуст. Проверьте ссылку на CSV и нажмите «Обновить цены»."
+        keep_chooser = '<input type="hidden" name="choose" value="1">' if choosing else ""
         edit = form("watch", f'<input type="hidden" name="item" value="{esc(item)}">'
+                    f'{keep_chooser}'
                     f'<label>Название<input name="name" maxlength="120" value="{esc(name)}"></label>'
                     f'<label>Целевая цена закупки<input name="target" inputmode="decimal" value="{target}"></label>'
                     f'<label>Комментарий<textarea name="note" maxlength="500" rows="2">{esc(selected["note"])}</textarea></label>'
-                    f'<label>Модель у конкурентов<input name="market_title" list="market-titles" value="{title}"></label>'
-                    f'<datalist id="market-titles">{options}</datalist>'
+                    f'{market_field}'
                     '<button>Сохранить изменения</button>', "fields")
+        if choosing:
+            edit = f'<p>{market_hint} Если модели в CSV нет, оставьте поле пустым.</p>{edit}'
         if detected:
             edit += f'<p>Найдена в CSV по названию товара · {esc(detected)}</p>'
     elif item:
@@ -572,6 +588,7 @@ def page(query, error="", addition=None):
                                f'<td>{esc(row["stock"] if row["stock"] is not None else "—")}</td></tr>'
                                for row in details)
         heading = selected["name"] if selected else (known["name"] if known else f"Товар {item}")
+        heading = f"Выбор модели · {heading}" if choosing and selected else heading
         history = f'<section id="product-details"><h2>{esc(heading)}</h2>{edit}<h3>История цен</h3><div class="table"><table><thead><tr><th>Минск</th>'
         history += '<th>Источник</th><th>Цена</th><th>Закупка</th><th>Остаток</th></tr></thead>'
         history += f'<tbody>{history_rows}</tbody></table></div></section>'
@@ -616,14 +633,14 @@ def page(query, error="", addition=None):
     td.note{{white-space:pre-wrap;overflow-wrap:anywhere;min-width:145px;max-width:240px}}
     </style><main><header><div><h1>Монитор закупок</h1><p>ShopManager · {refreshed}<br>
     Конкуренты · {market_time} · {currency}</p></div>{sync_button}</header>
-    {problem}<section><h2>Список наблюдения · {len(rows)}</h2>{table}</section>
+    {problem}{history if choosing else ""}<section><h2>Список наблюдения · {len(rows)}</h2>{table}</section>
     <section><h2>Добавить товар</h2>{add_feedback}{form_problem}
     <p>Если название есть в каталоге, достаточно ID. Для остальных товаров укажите название при добавлении.</p>
     {add}
     <form method="get" class="search"><label>Поиск ID в последней выгрузке<input name="q" value="{esc(search)}"></label>
     <button class="quiet">Найти</button></form>
     {"<ul class='matches'>" + "".join(search_results) + "</ul>" if search_results else ("<p>Совпадений нет</p>" if search else "")}</section>
-    {history}<section><h2>Источники данных</h2>{settings}</section>
+    {history if not choosing else ""}<section><h2>Источники данных</h2>{settings}</section>
     <details><summary>Роли источников · {len(sources)}</summary>
     <p>Оптовые цены ShopManager учитываются автоматически. Ненужный прайс можно исключить.</p>{"".join(source_forms)}</details>
     </main></html>"""
@@ -682,7 +699,10 @@ class Handler(BaseHTTPRequestHandler):
                 query = {"q": [data["q"]]} if data.get("q") else {}
                 self.render(query, addition=(data["item"].strip(), created))
             elif action == "watch":
-                self.render({"item": [data["item"].strip()]})
+                query = {"item": [data["item"].strip()]}
+                if data.get("choose") == "1":
+                    query["choose"] = ["1"]
+                self.render(query)
             else:
                 self.render({})
         except FormError as exc:
@@ -696,6 +716,8 @@ class Handler(BaseHTTPRequestHandler):
                 query["add_name"] = [data.get("name", "")]
             elif data.get("item"):
                 query["item"] = [data["item"]]
+                if data.get("choose") == "1":
+                    query["choose"] = ["1"]
             self.render(query, str(exc), 400)
         except (ValueError, KeyError, sqlite3.Error, OSError) as exc:
             self.render({}, f"Операция не выполнена ({type(exc).__name__}).", 400)

@@ -443,7 +443,7 @@ def form(action, body, css=""):
             f'<input type="hidden" name="action" value="{action}">{body}</form>')
 
 
-def page(query, error=""):
+def page(query, error="", addition=None):
     search = query.get("q", [""])[0].strip()[:120]
     item = query.get("item", [""])[0][:120]
     with database() as db:
@@ -477,6 +477,15 @@ def page(query, error=""):
         market_time = datetime.fromtimestamp(market_checked, timezone.utc).strftime(
             "%d.%m.%Y %H:%M UTC") if market_checked else "ожидается"
     currency = esc(OPTIONS.get("currency", "BYN"))
+    add_feedback = ""
+    if addition:
+        added_item, created = addition
+        added = next((row for row in rows if row["item"] == added_item), None)
+        if added:
+            label = "Добавлен в список наблюдения" if created else "Уже в списке наблюдения"
+            link = "?" + urllib.parse.urlencode({"item": added_item}) + "#product-details"
+            add_feedback = (f'<p class="add-feedback" role="status"><strong>{label}.</strong> '
+                            f'<a href="{esc(link)}">{esc(added["name"])} · ID {esc(added_item)}</a></p>')
     cards = []
     for row in sorted(rows, key=lambda row: decision(row)[1] or 4):
         reason, signal = decision(row)
@@ -525,8 +534,10 @@ def page(query, error=""):
             f'{"" if row["name"] else name_input}<button>Добавить к отслеживанию</button>', "fields"))
         caption = f'{row["name"]} · ID {found_id}' if row["name"] else f'ID {found_id}'
         search_results.append(f'<li><a href="{esc(link)}">{esc(caption)}</a>{control}</li>')
-    add = form("add", f'<label>ID товара<input name="item" required maxlength="120" value="{esc(query.get("add_id", [""])[0])}"></label>'
-               f'{name_input}<button>Добавить по ID</button>', "fields")
+    input_name = esc(query.get("add_name", [""])[0])
+    add = form("add", f'<label>ID товара<input name="item" required maxlength="120" autocomplete="off" value="{esc(query.get("add_id", [""])[0])}"></label>'
+               f'<label>Название товара<input name="name" maxlength="120" value="{input_name}"></label>'
+               '<button>Добавить по ID</button>', "fields")
     settings = form("settings",
         f'<label>Ссылка на CSV конкурентов<input type="password" autocomplete="off" name="competitor_url" '
         f'value="{esc(OPTIONS.get("competitor_url") or "")}"></label>'
@@ -571,7 +582,10 @@ def page(query, error=""):
                         '<thead><tr><th>Минск</th><th>Магазин</th><th>Цена</th></tr></thead>'
                         f'<tbody>{prices}</tbody></table></div></section>')
     sync_button = form("sync", '<button class="quiet">Обновить цены</button>')
-    problem = f'<p class="error" role="alert">{esc(error or LAST_ERROR)}</p>' if error or LAST_ERROR else ""
+    add_error = error if query.get("add_error") else ""
+    problem_text = (error if not add_error else "") or LAST_ERROR
+    problem = f'<p class="error" role="alert">{esc(problem_text)}</p>' if problem_text else ""
+    form_problem = f'<p class="error" role="alert">{esc(add_error)}</p>' if add_error else ""
     table = (f'<div class="table"><table><thead><tr><th>Товар</th><th>Закупка</th>'
              f'<th>Мин. за 90 дней</th><th>Конкуренты</th><th>Цель</th>'
              f'<th>Сигнал</th><th>Комментарий</th><th></th></tr></thead><tbody>{"".join(cards)}</tbody></table></div>'
@@ -596,13 +610,14 @@ def page(query, error=""):
     summary{{cursor:pointer;font-weight:650}} .error{{color:#9b2828}}
     .matches{{list-style:none;padding:0}} .matches li{{display:flex;flex-wrap:wrap;gap:14px;align-items:center;margin:8px 0}}
     .search{{margin-top:16px}}
+    .add-feedback{{padding:10px 12px;background:#e1f2e9;border-radius:8px}}
     .signal{{display:inline-block;padding:4px 8px;border-radius:6px;background:#e1f2e9;color:#164e38}}
     .signal-2{{background:#fff0cf;color:#704600}} .signal-3{{background:#e8eff9;color:#234566}}
     td.note{{white-space:pre-wrap;overflow-wrap:anywhere;min-width:145px;max-width:240px}}
     </style><main><header><div><h1>Монитор закупок</h1><p>ShopManager · {refreshed}<br>
     Конкуренты · {market_time} · {currency}</p></div>{sync_button}</header>
     {problem}<section><h2>Список наблюдения · {len(rows)}</h2>{table}</section>
-    <section><h2>Добавить товар</h2>
+    <section><h2>Добавить товар</h2>{add_feedback}{form_problem}
     <p>Если название есть в каталоге, достаточно ID. Для остальных товаров укажите название при добавлении.</p>
     {add}
     <form method="get" class="search"><label>Поиск ID в последней выгрузке<input name="q" value="{esc(search)}"></label>
@@ -624,8 +639,8 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass
 
-    def render(self, query, error="", status=200):
-        content = page(query, error).encode("utf-8")
+    def render(self, query, error="", status=200, addition=None):
+        content = page(query, error, addition).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Cache-Control", "no-store")
@@ -662,19 +677,23 @@ class Handler(BaseHTTPRequestHandler):
                 finally:
                     LOCK.release()
             else:
-                self.change(data, action)
-            if action == "add" and data.get("q"):
-                self.render({"q": [data["q"]]})
+                created = self.change(data, action)
+            if action == "add":
+                query = {"q": [data["q"]]} if data.get("q") else {}
+                self.render(query, addition=(data["item"].strip(), created))
             elif action == "watch":
                 self.render({"item": [data["item"].strip()]})
             else:
                 self.render({})
         except FormError as exc:
             query = {}
+            if data.get("action") == "add":
+                query["add_error"] = ["1"]
             if data.get("q"):
                 query["q"] = [data["q"]]
             elif data.get("action") == "add":
                 query["add_id"] = [data.get("item", "")]
+                query["add_name"] = [data.get("name", "")]
             elif data.get("item"):
                 query["item"] = [data["item"]]
             self.render(query, str(exc), 400)
@@ -702,13 +721,13 @@ class Handler(BaseHTTPRequestHandler):
             elif action == "add":
                 existing = db.execute("SELECT name FROM watch WHERE item=?", (item,)).fetchone()
                 if existing:
-                    return
+                    return False
                 name = data.get("name", "").strip()
                 if len(name) > 120:
                     raise FormError("Название должно быть не длиннее 120 символов.")
                 if not name and not db.execute("SELECT 1 FROM product_names WHERE item=?", (item,)).fetchone():
                     raise FormError("Для этого ID нет названия в каталоге. Введите название товара.")
-                db.execute("INSERT OR IGNORE INTO watch VALUES(?,?,NULL)", (item, name))
+                return db.execute("INSERT OR IGNORE INTO watch VALUES(?,?,NULL)", (item, name)).rowcount == 1
             elif action == "watch":
                 name = data.get("name", "").strip()
                 target = data.get("target", "").strip()

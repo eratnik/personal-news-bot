@@ -315,7 +315,21 @@ def results(db):
         time.time() - state(db, "market_checked") <= 2 * int(OPTIONS.get("poll_hours", 6)) * 3600
     )
     rows = db.execute("""
-        WITH recent AS (SELECT max(id) AS id FROM snapshots)
+        WITH recent AS (SELECT max(id) AS id FROM snapshots),
+        suppliers AS (
+            SELECT id, name FROM sources
+            WHERE role IN ('supplier','unassigned')
+              AND name NOT LIKE 'Парсер%' AND name NOT LIKE 'парсер%'
+        ), historical AS (
+            SELECT h.item, h.cost, t.captured, hs.name AS supplier,
+                   row_number() OVER (
+                       PARTITION BY h.item ORDER BY h.cost, t.captured DESC, t.id DESC, hs.name, hs.id
+                   ) AS rank
+            FROM watch w JOIN offers h ON h.item=w.item
+            JOIN snapshots t ON t.id=h.snapshot
+            JOIN suppliers hs ON hs.id=h.source
+            WHERE t.captured>=? AND h.stock>0 AND h.cost IS NOT NULL
+        )
         SELECT w.item, w.target, w.name AS custom_name,
           coalesce(nullif(nullif(w.name,'ID ' || w.item),''), p.name, l.title,
                    'Название не указано') AS name,
@@ -324,20 +338,18 @@ def results(db):
           l.title AS manual_market_title, coalesce(n.note,'') AS note,
           coalesce(meta.brand,'') AS brand, coalesce(meta.category,'') AS category,
           missing.item IS NOT NULL AS market_marked_missing,
-          (SELECT min(h.cost) FROM offers h JOIN snapshots t ON t.id=h.snapshot
-           JOIN sources hs ON hs.id=h.source
-           WHERE h.item=w.item AND t.captured>=? AND h.stock>0
-           AND hs.role IN ('supplier','unassigned')
-           AND hs.name NOT LIKE 'Парсер%' AND hs.name NOT LIKE 'парсер%') AS low_90,
-          (SELECT min(h.cost) FROM offers h JOIN sources hs ON hs.id=h.source
+          low.cost AS low_90, low.captured AS low_captured, low.supplier AS low_supplier,
+          (SELECT hs.name FROM offers h JOIN suppliers hs ON hs.id=h.source
+           WHERE h.item=w.item AND h.snapshot=(SELECT id FROM recent) AND h.cost IS NOT NULL
+           ORDER BY (coalesce(h.stock,0)>0) DESC, h.cost, hs.name, hs.id LIMIT 1) AS buy_supplier,
+          (SELECT min(h.cost) FROM offers h JOIN suppliers hs ON hs.id=h.source
            WHERE h.item=w.item AND h.snapshot<(SELECT id FROM recent) AND h.stock>0
-           AND h.cost IS NOT NULL AND hs.role IN ('supplier','unassigned')
-           AND hs.name NOT LIKE 'Парсер%' AND hs.name NOT LIKE 'парсер%'
+           AND h.cost IS NOT NULL
            GROUP BY h.snapshot ORDER BY h.snapshot DESC LIMIT 1) AS previous_buy
         FROM watch w
         LEFT JOIN offers o ON o.item=w.item AND o.snapshot=(SELECT id FROM recent)
-        LEFT JOIN sources s ON s.id=o.source AND s.role IN ('supplier','unassigned')
-          AND s.name NOT LIKE 'Парсер%' AND s.name NOT LIKE 'парсер%'
+        LEFT JOIN suppliers s ON s.id=o.source
+        LEFT JOIN historical low ON low.item=w.item AND low.rank=1
         LEFT JOIN market_links l ON l.item=w.item
         LEFT JOIN market_missing missing ON missing.item=w.item
         LEFT JOIN product_names p ON p.item=w.item
@@ -381,6 +393,23 @@ def decision(row):
 
 def amount(value):
     return "—" if value is None else f"{Decimal(value) / 100:.2f}"
+
+
+def competitor_gap(row):
+    buy, market = row["buy"], row["market"]
+    if buy is None or market is None or market <= 0:
+        return ""
+    difference = market - buy
+    if not difference:
+        return "На уровне конкурента"
+    currency = OPTIONS.get("currency", "BYN")
+    percent = Decimal(abs(difference)) * 100 / market
+    direction = "Дешевле" if difference > 0 else "Дороже"
+    return f"{direction} на {amount(abs(difference))} {currency} ({percent:.1f}%)"
+
+
+def low_price_date(row):
+    return datetime.fromtimestamp(row["low_captured"] + 3 * 3600, timezone.utc).strftime("%d.%m.%Y")
 
 
 def purchase_trend(current, previous):
@@ -443,12 +472,24 @@ def send_due():
             decision(row)[1], -(row["market"] or row["target"] or 0) + row["buy"]
         ))
         lines = [f"К закупке · {OPTIONS.get('currency', 'BYN')}"]
+        footer = f"Всего позиций: {len(candidates)}. Полный список в приложении."
         for row in candidates[:15]:
-            lines.append(f"{row['name'][:80]} [{row['item'][:40]}] · закупка {amount(row['buy'])}"
-                         f" · рынок {amount(row['market'])} · {decision(row)[0]}")
-        if len(candidates) > 15:
-            lines.append(f"Всего позиций: {len(candidates)}. Полный список в приложении.")
-        deliver("\n".join(lines)[:3900])
+            details = [f"Закупка {amount(row['buy'])} · {row['buy_supplier'][:80]}", decision(row)[0]]
+            if row["previous_buy"] is not None and row["previous_buy"] != row["buy"]:
+                change = Decimal(row["buy"] - row["previous_buy"]) / 100
+                details.append(f"Изменение закупки {change:+.2f} (было {amount(row['previous_buy'])})")
+            if row["market"] is not None:
+                details.append(f"Конкуренты {amount(row['market'])} · {competitor_gap(row)}")
+            if row["low_90"] is not None:
+                details.append(f"Мин. за 90 дней {amount(row['low_90'])} · {low_price_date(row)}"
+                               f" · {row['low_supplier'][:80]}")
+            block = f"{row['name'][:80]} [{row['item'][:40]}]\n" + "\n".join(details)
+            if len("\n\n".join([*lines, block, footer])) > 3900:
+                break
+            lines.append(block)
+        if len(lines) - 1 < len(candidates):
+            lines.append(footer)
+        deliver("\n\n".join(lines))
     with database() as db:
         db.execute("REPLACE INTO state VALUES('digest',?)", (now,))
 
@@ -792,9 +833,22 @@ def page(query, error="", addition=None, *, editor=False, csrf_token=TOKEN):
             buy = amount(row["unavailable_buy"]) + '<span class="sub">Остаток не подтверждён</span>'
         elif row["buy"] is None:
             buy = '<span class="sub">Нет закупочной цены</span>'
+        if row["buy_supplier"]:
+            buy += f'<span class="sub">{esc(row["buy_supplier"])}</span>'
+        low = amount(row["low_90"])
+        if row["low_90"] is not None:
+            context = f'{low_price_date(row)} · {row["low_supplier"]}'
+            if row["buy"] == row["low_90"]:
+                context = f'Сейчас на минимуме · {context}'
+            elif row["buy"] is not None:
+                context += f' · сейчас +{amount(row["buy"] - row["low_90"])}'
+            low += f'<span class="sub">{esc(context)}</span>'
         if row["market"] is not None:
             shops = esc(", ".join(row["market_shops"]))
             market = f'{amount(row["market"])}<span class="sub market-shops">{shops}</span>'
+            gap = competitor_gap(row)
+            if gap:
+                market += f'<span class="sub">{esc(gap)}</span>'
         elif row["market_title"]:
             market = '<span class="sub">Нет актуальной цены</span>'
         elif row["market_marked_missing"]:
@@ -805,7 +859,7 @@ def page(query, error="", addition=None, *, editor=False, csrf_token=TOKEN):
         note = f'<a href="{esc(detail)}#product-details">{esc(row["note"] or "Добавить комментарий")}</a>'
         cards.append(f'<tr><td><a href="{esc(detail)}#product-details">{esc(row["name"])}</a>'
                      f'{subtitle}</td>'
-                     f'<td>{buy}</td><td>{amount(row["low_90"])}</td><td>{market}</td>'
+                     f'<td>{buy}</td><td>{low}</td><td>{market}</td>'
                      f'<td>{amount(row["target"])}</td><td>{status}</td><td class="note">{note}</td><td>{action}</td></tr>')
     roles = {"unassigned": "Автоматически", "supplier": "Поставщик", "ignored": "Не учитывать"}
     source_forms = []

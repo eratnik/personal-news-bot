@@ -95,6 +95,9 @@ def initialize():
             CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS product_names (item TEXT PRIMARY KEY, name TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS watch_notes (item TEXT PRIMARY KEY, note TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS watch_metadata (
+                item TEXT PRIMARY KEY, brand TEXT NOT NULL, category TEXT NOT NULL
+            );
         """)
 
 
@@ -319,6 +322,7 @@ def results(db):
           min(CASE WHEN s.id IS NOT NULL AND o.stock>0 THEN o.cost END) AS buy,
           min(CASE WHEN s.id IS NOT NULL AND coalesce(o.stock,0)<=0 THEN o.cost END) AS unavailable_buy,
           l.title AS manual_market_title, coalesce(n.note,'') AS note,
+          coalesce(meta.brand,'') AS brand, coalesce(meta.category,'') AS category,
           missing.item IS NOT NULL AS market_marked_missing,
           (SELECT min(h.cost) FROM offers h JOIN snapshots t ON t.id=h.snapshot
            JOIN sources hs ON hs.id=h.source
@@ -333,6 +337,7 @@ def results(db):
         LEFT JOIN market_missing missing ON missing.item=w.item
         LEFT JOIN product_names p ON p.item=w.item
         LEFT JOIN watch_notes n ON n.item=w.item
+        LEFT JOIN watch_metadata meta ON meta.item=w.item
         GROUP BY w.item ORDER BY w.name COLLATE NOCASE
     """, (int(time.time()) - 90 * 86400,)).fetchall()
     market = [(row["title"], model_key(row["title"]), row["price"]) for row in db.execute(
@@ -538,15 +543,22 @@ def read_product_rows(rows, strings, cells, headings):
         if item in products:
             duplicates += 1
         else:
-            products[item] = name
+            brand = values.get(headings.get("бренд"), "")[:120]
+            category = values.get(headings.get("категория"), "")[:120]
+            products[item] = (name, brand, category)
     return products, invalid, duplicates
 
 
 def import_xlsx(raw):
     products, invalid, duplicates = xlsx_products(raw)
     with database() as db:
-        db.executemany("INSERT OR IGNORE INTO watch(item,name,target) VALUES(?,?,NULL)", products.items())
+        db.executemany("INSERT OR IGNORE INTO watch(item,name,target) VALUES(?,?,NULL)",
+                       ((item, name) for item, (name, _, _) in products.items()))
         inserted = db.total_changes
+        db.executemany("""INSERT INTO watch_metadata VALUES(?,?,?) ON CONFLICT(item) DO UPDATE SET
+            brand=coalesce(nullif(excluded.brand,''),watch_metadata.brand),
+            category=coalesce(nullif(excluded.category,''),watch_metadata.category)""",
+            ((item, brand, category) for item, (_, brand, category) in products.items() if brand or category))
     return inserted, len(products) - inserted, invalid, duplicates
 
 
@@ -589,6 +601,90 @@ def model_chooser(selected, models, term, checked, form):
     return (f'<section id="market-model"><h2>Выбор модели · {esc(selected["name"])}</h2>'
             f'<p>ID {item} · {esc(current_text)}</p>{search}{binding}'
             f'<div class="model-actions">{status}{missing}</div><p><a href="?">Вернуться к списку</a></p></section>')
+
+
+WATCH_FILTERS = {
+    "all": "Все", "signal": "Есть сигнал", "available": "В наличии",
+    "unconfirmed": "Остаток не подтверждён", "no_market": "Нет цены конкурента",
+}
+WATCH_ORDERS = {
+    "signal": "Сначала с сигналом", "cost": "Закупка по возрастанию",
+    "gap": "Разница с конкурентом, BYN", "gap_percent": "Разница с конкурентом, %",
+    "near_low": "Ближе к минимуму за 90 дней",
+}
+
+
+def watch_view(rows, query):
+    keys = {"watch_q": "", "filter": "all", "order": "signal", "brand": "", "category": ""}
+    filters = {key: query.get(key, [value])[0].strip()[:120] for key, value in keys.items()}
+    if filters["filter"] not in WATCH_FILTERS:
+        filters["filter"] = "all"
+    if filters["order"] not in WATCH_ORDERS:
+        filters["order"] = "signal"
+    term = filters["watch_q"].casefold()
+    model_term = model_key(term)
+    visible = []
+    for row in rows:
+        status = filters["filter"]
+        if status == "signal" and not decision(row)[1]:
+            continue
+        if status == "available" and row["buy"] is None:
+            continue
+        if status == "unconfirmed" and (row["buy"] is not None or row["unavailable_buy"] is None):
+            continue
+        if status == "no_market" and row["market"] is not None:
+            continue
+        if any(filters[key] and row[key] != filters[key] for key in ("brand", "category")):
+            continue
+        if (term and term not in row["item"].casefold() and term not in row["name"].casefold()
+                and (not model_term or model_term not in model_key(row["name"]))):
+            continue
+        visible.append(row)
+
+    def ranking(row):
+        buy, market, low = row["buy"], row["market"], row["low_90"]
+        match filters["order"]:
+            case "cost":
+                return buy if buy is not None else float("inf")
+            case "gap" | "gap_percent":
+                if buy is None or not market:
+                    return float("inf")
+                return (buy - market) / market if filters["order"] == "gap_percent" else buy - market
+            case "near_low":
+                return abs(buy - low) / low if buy is not None and low else float("inf")
+            case _:
+                return decision(row)[1] or 4
+
+    return sorted(visible, key=lambda row: (ranking(row), row["name"].casefold(), row["item"])), filters
+
+
+def watch_controls(rows, filters):
+    chips = []
+    for key, label in WATCH_FILTERS.items():
+        href = "?" + urllib.parse.urlencode(dict(filters, filter=key)) + "#watchlist"
+        current = ' aria-current="true"' if key == filters["filter"] else ""
+        chips.append(f'<a href="{esc(href)}"{current}>{label}</a>')
+
+    def select(key, caption, choices):
+        options = "".join(f'<option value="{esc(value)}" {"selected" if value == filters[key] else ""}>'
+                          f'{esc(label)}</option>' for value, label in choices)
+        return f'<label>{caption}<select name="{key}">{options}</select></label>'
+
+    extra = []
+    for key, caption in (("brand", "Бренд"), ("category", "Категория")):
+        values = sorted({row[key] for row in rows if row[key]} | ({filters[key]} if filters[key] else set()),
+                        key=str.casefold)
+        if values:
+            extra.append(select(key, caption, [("", "Все")] + [(value, value) for value in values]))
+    extra.append(select("order", "Сортировка", WATCH_ORDERS.items()))
+    opened = " open" if filters["brand"] or filters["category"] or filters["order"] != "signal" else ""
+    return (f'<nav class="watch-filters" aria-label="Фильтры списка">{"".join(chips)}</nav>'
+            f'<form method="get" action="?#watchlist"><input type="hidden" name="filter" value="{filters["filter"]}">'
+            f'<div class="fields"><label>Поиск в списке<input name="watch_q" maxlength="120" '
+            f'value="{esc(filters["watch_q"])}" placeholder="Название или ID"></label>'
+            '<button>Применить</button><a href="?#watchlist">Сбросить</a></div>'
+            f'<details class="watch-extra"{opened}><summary>Бренд, категория и сортировка</summary>'
+            f'<div class="fields">{"".join(extra)}</div></details></form>')
 
 
 def page(query, error="", addition=None, *, editor=False, csrf_token=TOKEN):
@@ -644,7 +740,9 @@ def page(query, error="", addition=None, *, editor=False, csrf_token=TOKEN):
             add_feedback = (f'<p class="add-feedback" role="status"><strong>{label}.</strong> '
                             f'<a href="{esc(link)}">{esc(added["name"])} · ID {esc(added_item)}</a></p>')
     cards = []
-    for row in sorted(rows, key=lambda row: decision(row)[1] or 4):
+    visible_rows, watch_filters = watch_view(rows, query)
+    controls = watch_controls(rows, watch_filters) if rows else ""
+    for row in visible_rows:
         reason, signal = decision(row)
         action = render_form("remove", f'<input type="hidden" name="item" value="{esc(row["item"])}">'
                       f'<button class="quiet" aria-label="Убрать из списка: {esc(row["name"])}">Убрать</button>')
@@ -761,7 +859,8 @@ def page(query, error="", addition=None, *, editor=False, csrf_token=TOKEN):
              f'<table class="watch-table"><thead><tr><th>Товар</th><th>Закупка</th>'
              f'<th>Мин. за 90 дней</th><th>Конкуренты</th><th>Цель</th>'
              f'<th>Сигнал</th><th>Комментарий</th><th aria-label="Действия"></th></tr></thead><tbody>{"".join(cards)}</tbody></table></div>'
-             if cards else '<p>Добавьте первый товар по ID из выгрузки.</p>')
+             if cards else ('<p>По выбранным фильтрам ничего не найдено.</p>' if rows else
+                            '<p>Добавьте первый товар по ID из выгрузки.</p>'))
     return f"""<!doctype html><html lang="ru"><meta charset="utf-8">
     <meta name="viewport" content="width=device-width,initial-scale=1">
     <title>Монитор закупок</title><style>
@@ -798,6 +897,11 @@ def page(query, error="", addition=None, *, editor=False, csrf_token=TOKEN):
     .watch-table tr:hover td{{background:#f7faf9}}
     .watch-table td.note{{white-space:pre-wrap}}
     .watch-table td:last-child button{{padding:5px 6px;font-size:14px}}
+    .watch-filters{{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:12px}}
+    .watch-filters a{{padding:6px 10px;border:1px solid #a9bcb5;border-radius:8px;text-decoration:none}}
+    .watch-filters a[aria-current]{{background:#124c3c;color:white;border-color:#124c3c}}
+    .watch-extra{{padding:10px 0;border:0;margin:8px 0 12px}}
+    .watch-extra .fields{{margin-top:10px}} .watch-extra select{{display:block;width:100%;margin-top:5px}}
     @media(max-width:600px){{section,details{{padding:12px}}}}
     h1 a{{color:inherit;text-decoration:none;font-weight:inherit}} h1 a:hover{{text-decoration:underline}}
     .model-options{{margin:14px 0;max-height:24rem;overflow:auto;border:1px solid #dce6e3}}
@@ -806,7 +910,7 @@ def page(query, error="", addition=None, *, editor=False, csrf_token=TOKEN):
     .model-option input{{width:auto;margin:0}} .model-actions{{display:flex;flex-wrap:wrap;gap:12px;margin-top:12px}}
     </style><main><header><div><h1><a href="?">Монитор закупок</a></h1><p>ShopManager · {refreshed}<br>
     Конкуренты · {market_time} · {currency}</p></div>{sync_button}</header>
-    {problem}{chooser}<section><h2>Список наблюдения · {len(rows)}</h2>{table}</section>
+    {problem}{chooser}<section id="watchlist"><h2>Список наблюдения · {len(visible_rows)} из {len(rows)}</h2>{controls}{table}</section>
     <section><h2>Добавить товар</h2>{add_feedback}{form_problem}
     <p>Если название есть в каталоге, достаточно ID. Для остальных товаров укажите название при добавлении.</p>
     {add}
@@ -962,6 +1066,7 @@ class Handler(BaseHTTPRequestHandler):
                 db.execute("DELETE FROM market_links WHERE item=?", (item,))
                 db.execute("DELETE FROM market_missing WHERE item=?", (item,))
                 db.execute("DELETE FROM watch_notes WHERE item=?", (item,))
+                db.execute("DELETE FROM watch_metadata WHERE item=?", (item,))
             elif action == "add":
                 existing = db.execute("SELECT name FROM watch WHERE item=?", (item,)).fetchone()
                 if existing:

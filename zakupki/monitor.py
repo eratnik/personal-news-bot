@@ -328,7 +328,12 @@ def results(db):
            JOIN sources hs ON hs.id=h.source
            WHERE h.item=w.item AND t.captured>=? AND h.stock>0
            AND hs.role IN ('supplier','unassigned')
-           AND hs.name NOT LIKE 'Парсер%' AND hs.name NOT LIKE 'парсер%') AS low_90
+           AND hs.name NOT LIKE 'Парсер%' AND hs.name NOT LIKE 'парсер%') AS low_90,
+          (SELECT min(h.cost) FROM offers h JOIN sources hs ON hs.id=h.source
+           WHERE h.item=w.item AND h.snapshot<(SELECT id FROM recent) AND h.stock>0
+           AND h.cost IS NOT NULL AND hs.role IN ('supplier','unassigned')
+           AND hs.name NOT LIKE 'Парсер%' AND hs.name NOT LIKE 'парсер%'
+           GROUP BY h.snapshot ORDER BY h.snapshot DESC LIMIT 1) AS previous_buy
         FROM watch w
         LEFT JOIN offers o ON o.item=w.item AND o.snapshot=(SELECT id FROM recent)
         LEFT JOIN sources s ON s.id=o.source AND s.role IN ('supplier','unassigned')
@@ -376,6 +381,16 @@ def decision(row):
 
 def amount(value):
     return "—" if value is None else f"{Decimal(value) / 100:.2f}"
+
+
+def purchase_trend(current, previous):
+    if current is None or previous is None or current == previous:
+        return ""
+    direction, arrow, description = (("down", "↓", "снизилась") if current < previous
+                                     else ("up", "↑", "выросла"))
+    label = f"Цена {description} на {amount(abs(current - previous))}. Предыдущая цена {amount(previous)}"
+    return (f' <span class="price-trend {direction}" role="img" aria-label="{esc(label)}" '
+            f'title="{esc(label)}">{arrow}</span>')
 
 
 def deliver(message):
@@ -772,7 +787,7 @@ def page(query, error="", addition=None, *, editor=False, csrf_token=TOKEN):
         detail = "?" + urllib.parse.urlencode({"item": row["item"]})
         identifier = f'ID {row["item"]}'
         subtitle = f'<span class="sub">{esc(identifier)}</span>'
-        buy = amount(row["buy"])
+        buy = amount(row["buy"]) + purchase_trend(row["buy"], row["previous_buy"])
         if row["buy"] is None and row["unavailable_buy"] is not None:
             buy = amount(row["unavailable_buy"]) + '<span class="sub">Остаток не подтверждён</span>'
         elif row["buy"] is None:
@@ -920,6 +935,7 @@ def page(query, error="", addition=None, *, editor=False, csrf_token=TOKEN):
     .watch-table tr:hover td{{background:#f7faf9}}
     .watch-table td.note{{white-space:pre-wrap}}
     .watch-table td:last-child button{{padding:5px 6px;font-size:14px}}
+    .price-trend{{font-weight:750}} .price-trend.down{{color:#16724e}} .price-trend.up{{color:#a72932}}
     .watch-bar label{{min-width:140px}}
     .watch-bar select{{display:block;width:100%;margin-top:5px}}
     .watch-submit{{margin-bottom:12px;align-items:center}}

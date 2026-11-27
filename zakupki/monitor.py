@@ -603,10 +603,11 @@ def model_chooser(selected, models, term, checked, form):
             f'<div class="model-actions">{status}{missing}</div><p><a href="?">Вернуться к списку</a></p></section>')
 
 
-WATCH_FILTERS = {
-    "all": "Все", "signal": "Есть сигнал", "available": "В наличии",
-    "unconfirmed": "Остаток не подтверждён", "no_market": "Нет цены конкурента",
-}
+WATCH_STOCK = {"": "Любое", "available": "В наличии", "unconfirmed": "Остаток не подтверждён",
+               "no_price": "Нет закупочной цены"}
+WATCH_MARKET = {"": "Любая", "priced": "Есть цена", "no_market": "Нет цены",
+                "unlinked": "Модель не сопоставлена"}
+WATCH_SIGNALS = {"": "Любой", "signal": "Есть сигнал", "none": "Без сигнала"}
 WATCH_ORDERS = {
     "signal": "Сначала с сигналом", "cost": "Закупка по возрастанию",
     "gap": "Разница с конкурентом, BYN", "gap_percent": "Разница с конкурентом, %",
@@ -615,24 +616,46 @@ WATCH_ORDERS = {
 
 
 def watch_view(rows, query):
-    keys = {"watch_q": "", "filter": "all", "order": "signal", "brand": "", "category": ""}
+    keys = {"watch_q": "", "order": "signal", "brand": "", "category": "",
+            "stock": "", "market_filter": "", "signal_filter": "", "price_from": "", "price_to": ""}
     filters = {key: query.get(key, [value])[0].strip()[:120] for key, value in keys.items()}
-    if filters["filter"] not in WATCH_FILTERS:
-        filters["filter"] = "all"
+    legacy = query.get("filter", [""])[0]
+    if legacy in WATCH_STOCK and not filters["stock"]:
+        filters["stock"] = legacy
+    if legacy == "no_market" and not filters["market_filter"]:
+        filters["market_filter"] = legacy
+    if legacy == "signal" and not filters["signal_filter"]:
+        filters["signal_filter"] = legacy
+    for key, choices in (("stock", WATCH_STOCK), ("market_filter", WATCH_MARKET), ("signal_filter", WATCH_SIGNALS)):
+        if filters[key] not in choices:
+            filters[key] = ""
     if filters["order"] not in WATCH_ORDERS:
         filters["order"] = "signal"
     term = filters["watch_q"].casefold()
     model_term = model_key(term)
+    price_from, price_to = (money(filters[key]) for key in ("price_from", "price_to"))
     visible = []
     for row in rows:
-        status = filters["filter"]
-        if status == "signal" and not decision(row)[1]:
+        if filters["signal_filter"] and bool(decision(row)[1]) != (filters["signal_filter"] == "signal"):
             continue
-        if status == "available" and row["buy"] is None:
+        stock = filters["stock"]
+        if stock == "available" and row["buy"] is None:
             continue
-        if status == "unconfirmed" and (row["buy"] is not None or row["unavailable_buy"] is None):
+        if stock == "unconfirmed" and (row["buy"] is not None or row["unavailable_buy"] is None):
             continue
-        if status == "no_market" and row["market"] is not None:
+        if stock == "no_price" and (row["buy"] is not None or row["unavailable_buy"] is not None):
+            continue
+        market = filters["market_filter"]
+        if market == "no_market" and row["market"] is not None:
+            continue
+        if market == "priced" and row["market"] is None:
+            continue
+        if market == "unlinked" and row["market_title"]:
+            continue
+        price = row["buy"] if row["buy"] is not None else row["unavailable_buy"]
+        if price_from is not None and (price is None or price < price_from):
+            continue
+        if price_to is not None and (price is None or price > price_to):
             continue
         if any(filters[key] and row[key] != filters[key] for key in ("brand", "category")):
             continue
@@ -659,32 +682,32 @@ def watch_view(rows, query):
 
 
 def watch_controls(rows, filters):
-    chips = []
-    for key, label in WATCH_FILTERS.items():
-        href = "?" + urllib.parse.urlencode(dict(filters, filter=key)) + "#watchlist"
-        current = ' aria-current="true"' if key == filters["filter"] else ""
-        chips.append(f'<a href="{esc(href)}"{current}>{label}</a>')
-
     def select(key, caption, choices):
         options = "".join(f'<option value="{esc(value)}" {"selected" if value == filters[key] else ""}>'
                           f'{esc(label)}</option>' for value, label in choices)
         return f'<label>{caption}<select name="{key}">{options}</select></label>'
 
-    extra = []
+    catalog = []
     for key, caption in (("brand", "Бренд"), ("category", "Категория")):
         values = sorted({row[key] for row in rows if row[key]} | ({filters[key]} if filters[key] else set()),
                         key=str.casefold)
         if values:
-            extra.append(select(key, caption, [("", "Все")] + [(value, value) for value in values]))
-    extra.append(select("order", "Сортировка", WATCH_ORDERS.items()))
-    opened = " open" if filters["brand"] or filters["category"] or filters["order"] != "signal" else ""
-    return (f'<nav class="watch-filters" aria-label="Фильтры списка">{"".join(chips)}</nav>'
-            f'<form method="get" action="?#watchlist"><input type="hidden" name="filter" value="{filters["filter"]}">'
-            f'<div class="fields"><label>Поиск в списке<input name="watch_q" maxlength="120" '
+            catalog.append(select(key, caption, [("", "Все")] + [(value, value) for value in values]))
+    extra = [
+        f'<label>Закупка от<input name="price_from" type="number" step="0.01" min="0" value="{esc(filters["price_from"])}"></label>',
+        f'<label>Закупка до<input name="price_to" type="number" step="0.01" min="0" value="{esc(filters["price_to"])}"></label>',
+        select("order", "Сортировка", WATCH_ORDERS.items()),
+    ]
+    opened = " open" if filters["price_from"] or filters["price_to"] or filters["order"] != "signal" else ""
+    return (f'<form method="get" action="?#watchlist">'
+            f'<div class="fields watch-bar"><label>Поиск в списке<input name="watch_q" maxlength="120" '
             f'value="{esc(filters["watch_q"])}" placeholder="Название или ID"></label>'
-            '<button>Применить</button><a href="?#watchlist">Сбросить</a></div>'
-            f'<details class="watch-extra"{opened}><summary>Бренд, категория и сортировка</summary>'
-            f'<div class="fields">{"".join(extra)}</div></details></form>')
+            f'{"".join(catalog)}{select("stock", "Наличие", WATCH_STOCK.items())}'
+            f'{select("market_filter", "Цена конкурента", WATCH_MARKET.items())}'
+            f'{select("signal_filter", "Сигнал", WATCH_SIGNALS.items())}</div>'
+            f'<details class="watch-extra"{opened}><summary>Диапазон цен и сортировка</summary>'
+            f'<div class="fields">{"".join(extra)}</div></details>'
+            '<div class="fields watch-submit"><button>Применить</button><a href="?#watchlist">Сбросить</a></div></form>')
 
 
 def page(query, error="", addition=None, *, editor=False, csrf_token=TOKEN):
@@ -897,9 +920,9 @@ def page(query, error="", addition=None, *, editor=False, csrf_token=TOKEN):
     .watch-table tr:hover td{{background:#f7faf9}}
     .watch-table td.note{{white-space:pre-wrap}}
     .watch-table td:last-child button{{padding:5px 6px;font-size:14px}}
-    .watch-filters{{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:12px}}
-    .watch-filters a{{padding:6px 10px;border:1px solid #a9bcb5;border-radius:8px;text-decoration:none}}
-    .watch-filters a[aria-current]{{background:#124c3c;color:white;border-color:#124c3c}}
+    .watch-bar label{{min-width:140px}}
+    .watch-bar select{{display:block;width:100%;margin-top:5px}}
+    .watch-submit{{margin-bottom:12px;align-items:center}}
     .watch-extra{{padding:10px 0;border:0;margin:8px 0 12px}}
     .watch-extra .fields{{margin-top:10px}} .watch-extra select{{display:block;width:100%;margin-top:5px}}
     @media(max-width:600px){{section,details{{padding:12px}}}}

@@ -92,6 +92,14 @@ def initialize():
                 observed INTEGER NOT NULL, title TEXT NOT NULL, shop TEXT NOT NULL,
                 price INTEGER NOT NULL, PRIMARY KEY(title,observed,shop)
             );
+            CREATE TABLE IF NOT EXISTS hidden_market_shops (shop TEXT PRIMARY KEY);
+            CREATE VIEW IF NOT EXISTS visible_market AS
+                SELECT m.title, m.shop, m.price FROM market m
+                WHERE NOT EXISTS (SELECT 1 FROM hidden_market_shops h WHERE h.shop=m.shop);
+            CREATE VIEW IF NOT EXISTS market_models AS
+                SELECT m.title, min(CASE WHEN h.shop IS NULL THEN m.price END) AS price
+                FROM market m LEFT JOIN hidden_market_shops h ON h.shop=m.shop
+                GROUP BY m.title;
             CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS product_names (item TEXT PRIMARY KEY, name TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS watch_notes (item TEXT PRIMARY KEY, note TEXT NOT NULL);
@@ -358,11 +366,11 @@ def results(db):
         GROUP BY w.item ORDER BY w.name COLLATE NOCASE
     """, (int(time.time()) - 90 * 86400,)).fetchall()
     market = [(row["title"], model_key(row["title"]), row["price"]) for row in db.execute(
-        "SELECT title,min(price) AS price FROM market GROUP BY title")]
+        "SELECT title,price FROM market_models")]
     prices = {title: price for title, _, price in market}
     cheapest_shops = {}
     if fresh:
-        for offer in db.execute("SELECT title,shop,price FROM market WHERE price IS NOT NULL ORDER BY shop"):
+        for offer in db.execute("SELECT title,shop,price FROM visible_market WHERE price IS NOT NULL ORDER BY shop"):
             if offer["price"] == prices[offer["title"]]:
                 cheapest_shops.setdefault(offer["title"], []).append(offer["shop"])
     results = []
@@ -771,6 +779,7 @@ def page(query, error="", addition=None, *, editor=False, csrf_token=TOKEN):
     search = query.get("q", [""])[0].strip()[:120]
     item = query.get("item", [""])[0][:120]
     choosing = query.get("choose") == ["1"]
+    managing_shops = not editor and not item and query.get("shops") == ["1"]
     model_term = query.get("model_q", [""])[0].strip()[:120]
     with database() as db:
         checked = state(db, "checked")
@@ -778,10 +787,16 @@ def page(query, error="", addition=None, *, editor=False, csrf_token=TOKEN):
         latest = db.execute("SELECT max(id) FROM snapshots").fetchone()[0]
         rows = results(db)
         selected = next((row for row in rows if row["item"] == item), None)
-        market_models = db.execute("SELECT title, min(price) AS price FROM market GROUP BY title ORDER BY title").fetchall() if selected and choosing else []
+        market_models = db.execute("SELECT title, price FROM market_models ORDER BY title").fetchall() if selected and choosing else []
         market_rows = db.execute("""SELECT datetime(observed,'unixepoch','+3 hours') AS stamp,
-            shop, price FROM market_history WHERE title=? ORDER BY observed DESC,shop LIMIT 200""",
+            m.shop, m.price FROM market_history m WHERE title=?
+            AND NOT EXISTS (SELECT 1 FROM hidden_market_shops h WHERE h.shop=m.shop)
+            ORDER BY observed DESC,m.shop LIMIT 200""",
             (selected["market_title"],)).fetchall() if selected and selected["market_title"] else []
+        shops = db.execute("""SELECT m.shop, h.shop IS NOT NULL AS hidden
+            FROM (SELECT shop FROM market UNION SELECT shop FROM hidden_market_shops) m
+            LEFT JOIN hidden_market_shops h ON h.shop=m.shop ORDER BY m.shop COLLATE NOCASE
+            """).fetchall() if managing_shops else []
         found = db.execute("""WITH candidates AS (
             SELECT item FROM offers WHERE snapshot=? AND instr(item,?)>0
             UNION SELECT item FROM product_names WHERE instr(item,?)>0
@@ -819,8 +834,8 @@ def page(query, error="", addition=None, *, editor=False, csrf_token=TOKEN):
             add_feedback = (f'<p class="add-feedback" role="status"><strong>{label}.</strong> '
                             f'<a href="{esc(link)}">{esc(added["name"])} · ID {esc(added_item)}</a></p>')
     cards = []
-    visible_rows, watch_filters = watch_view(rows, query)
-    controls = watch_controls(rows, watch_filters) if rows else ""
+    visible_rows, watch_filters = watch_view(rows, query) if not (item or managing_shops) else ([], {})
+    controls = watch_controls(rows, watch_filters) if rows and watch_filters else ""
     for row in visible_rows:
         reason, signal = decision(row)
         action = render_form("remove", f'<input type="hidden" name="item" value="{esc(row["item"])}">'
@@ -935,8 +950,14 @@ def page(query, error="", addition=None, *, editor=False, csrf_token=TOKEN):
             history += ('<section><h2>История цен конкурентов</h2><div class="table"><table>'
                         '<thead><tr><th>Минск</th><th>Магазин</th><th>Цена</th></tr></thead>'
                         f'<tbody>{prices}</tbody></table></div></section>')
+    sync_context = (f'<input type="hidden" name="item" value="{esc(item)}">' if item else "")
+    if choosing and item:
+        sync_context += ('<input type="hidden" name="choose" value="1">'
+                         f'<input type="hidden" name="model_q" value="{esc(model_term)}">')
+    if managing_shops:
+        sync_context += '<input type="hidden" name="shops" value="1">'
     sync_button = (render_form("logout", '<button class="quiet">Выйти</button>') if editor
-                   else render_form("sync", '<button class="quiet">Обновить цены</button>'))
+                   else render_form("sync", sync_context + '<button class="quiet">Обновить цены</button>'))
     chooser = model_chooser(selected, market_models, model_term, market_checked, render_form) if choosing and selected else ""
     administration = "" if editor else (
         f'<section><h2>Источники данных</h2>{settings}</section>'
@@ -953,6 +974,35 @@ def page(query, error="", addition=None, *, editor=False, csrf_token=TOKEN):
              f'<th>Сигнал</th><th>Комментарий</th><th aria-label="Действия"></th></tr></thead><tbody>{"".join(cards)}</tbody></table></div>'
              if cards else ('<p>По выбранным фильтрам ничего не найдено.</p>' if rows else
                             '<p>Добавьте первый товар по ID из выгрузки.</p>'))
+    shop_settings = ""
+    if managing_shops:
+        shop_forms = []
+        for shop in shops:
+            action = "Показывать" if shop["hidden"] else "Скрыть"
+            status = "Скрыт" if shop["hidden"] else "Учитывается"
+            shop_forms.append(render_form("market_shop",
+                f'<input type="hidden" name="shop" value="{esc(shop["shop"])}">'
+                f'<input type="hidden" name="hidden" value="{int(not shop["hidden"])}">'
+                f'<label>{esc(shop["shop"])}<span class="sub">{status}</span></label>'
+                f'<button class="quiet" aria-label="{action} {esc(shop["shop"])}">{action}</button>', "source"))
+        shop_settings = ('<section><h2>Магазины конкурентов</h2>'
+                         '<p>Скрытые магазины исключаются из сравнения, истории в карточках и сводок.</p>'
+                         + ("".join(shop_forms) or "<p>Список появится после загрузки CSV конкурентов.</p>")
+                         + "</section>")
+    dashboard = f"""
+    <section id="watchlist"><h2>Список наблюдения · {len(visible_rows)} из {len(rows)}</h2>{controls}{table}</section>
+    <section><h2>Добавить товар</h2>{add_feedback}{form_problem}
+    <p>Если название есть в каталоге, достаточно ID. Для остальных товаров укажите название при добавлении.</p>
+    {add}
+    <form method="get" class="search"><label>Поиск ID в последней выгрузке<input name="q" value="{esc(search)}"></label>
+    <button class="quiet">Найти</button></form>
+    {"<ul class='matches'>" + "".join(search_results) + "</ul>" if search_results else ("<p>Совпадений нет</p>" if search else "")}
+    {upload}</section>{administration}"""
+    navigation = '<p><a href="?#watchlist">← К списку наблюдения</a></p>' if item or managing_shops else ""
+    if choosing and selected:
+        card_url = esc("?" + urllib.parse.urlencode({"item": item}) + "#product-details")
+        navigation = f'<p><a href="{card_url}">← К карточке товара</a></p>'
+    shops_link = '<br><a href="?shops=1">Настроить магазины</a>' if not (editor or item or managing_shops) else ""
     return f"""<!doctype html><html lang="ru"><meta charset="utf-8">
     <meta name="viewport" content="width=device-width,initial-scale=1">
     <title>Монитор закупок</title><style>
@@ -1002,16 +1052,9 @@ def page(query, error="", addition=None, *, editor=False, csrf_token=TOKEN):
       padding:10px;border-bottom:1px solid #edf1ef;cursor:pointer}}
     .model-option input{{width:auto;margin:0}} .model-actions{{display:flex;flex-wrap:wrap;gap:12px;margin-top:12px}}
     </style><main><header><div><h1><a href="?">Монитор закупок</a></h1><p>ShopManager · {refreshed}<br>
-    Конкуренты · {market_time} · {currency}</p></div>{sync_button}</header>
-    {problem}{chooser}<section id="watchlist"><h2>Список наблюдения · {len(visible_rows)} из {len(rows)}</h2>{controls}{table}</section>
-    <section><h2>Добавить товар</h2>{add_feedback}{form_problem}
-    <p>Если название есть в каталоге, достаточно ID. Для остальных товаров укажите название при добавлении.</p>
-    {add}
-    <form method="get" class="search"><label>Поиск ID в последней выгрузке<input name="q" value="{esc(search)}"></label>
-    <button class="quiet">Найти</button></form>
-    {"<ul class='matches'>" + "".join(search_results) + "</ul>" if search_results else ("<p>Совпадений нет</p>" if search else "")}
-    {upload}</section>
-    {history if not choosing else ""}{administration}
+    Конкуренты · {market_time} · {currency}{shops_link}</p></div>{sync_button}</header>
+    {navigation}{problem}{form_problem if item else ""}
+    {(chooser or history) if item else (shop_settings if managing_shops else dashboard)}
     </main></html>"""
 
 
@@ -1073,13 +1116,16 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_error(403)
                 return
             if action == "sync":
+                query = {key: [data[key]] for key in ("item", "choose", "model_q", "shops") if key in data}
                 if not LOCK.acquire(blocking=False):
-                    self.render({}, "Уже выполняется фоновая задача.", 409)
+                    self.render(query, "Уже выполняется фоновая задача.", 409)
                     return
                 try:
                     LAST_ERROR = sync()
                 finally:
                     LOCK.release()
+                self.render(query)
+                return
             else:
                 created = self.change(data, action)
             if action == "add":
@@ -1090,10 +1136,14 @@ class Handler(BaseHTTPRequestHandler):
             elif action in {"model_bind", "model_clear", "model_missing"}:
                 self.render({"item": [data["item"].strip()], "choose": ["1"],
                              "model_q": [data.get("model_q", "")]})
+            elif action == "market_shop":
+                self.render({"shops": ["1"]})
             else:
                 self.render({})
         except FormError as exc:
             query = {}
+            if data.get("action") == "market_shop":
+                query["shops"] = ["1"]
             if data.get("action") == "add":
                 query["add_error"] = ["1"]
             if data.get("q"):
@@ -1147,6 +1197,17 @@ class Handler(BaseHTTPRequestHandler):
             self.save_settings(data)
             return
         with database() as db:
+            if action == "market_shop":
+                shop, hidden = data.get("shop", ""), data.get("hidden")
+                if hidden == "0":
+                    db.execute("DELETE FROM hidden_market_shops WHERE shop=?", (shop,))
+                elif hidden == "1" and db.execute(
+                    "SELECT 1 FROM market WHERE shop=? LIMIT 1", (shop,)
+                ).fetchone():
+                    db.execute("INSERT OR IGNORE INTO hidden_market_shops VALUES(?)", (shop,))
+                else:
+                    raise FormError("Магазин отсутствует в текущей выгрузке.")
+                return
             if action == "role" and data.get("role") in {"unassigned", "supplier", "ignored"}:
                 db.execute("UPDATE sources SET role=? WHERE id=? AND role<>'parser'",
                            (data["role"], data["source"]))

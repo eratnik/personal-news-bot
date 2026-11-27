@@ -19,10 +19,13 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from email.message import EmailMessage
+from email.parser import BytesParser
+from email.policy import default as email_policy
 from functools import partial
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from http.cookies import CookieError, SimpleCookie
 from pathlib import Path
+from zipfile import BadZipFile, ZipFile
 
 LIMIT = 32 * 1024 * 1024
 DATA = Path(os.getenv("DATA_DIR", "/data"))
@@ -32,6 +35,8 @@ EDITOR_SESSION = "__Host-purchase_session"
 EDITOR_LOGIN = "__Host-purchase_login"
 EDITOR_SESSION_SECONDS = 12 * 3600
 EDITOR_ACTIONS = frozenset({"add", "watch", "remove", "model_bind", "model_clear", "model_missing"})
+IMPORT_LIMIT = 5 * 1024 * 1024
+XLSX_NS = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
 LOCK = threading.Lock()
 OPTIONS = {}
 LAST_ERROR = ""
@@ -455,9 +460,94 @@ def esc(value):
     return html.escape(str(value), quote=True)
 
 
-def form(action, body, css="", *, token=TOKEN):
-    return (f'<form method="post" class="{css}"><input type="hidden" name="token" value="{token}">'
+def form(action, body, css="", *, token=TOKEN, multipart=False):
+    enctype = ' enctype="multipart/form-data"' if multipart else ""
+    return (f'<form method="post" class="{css}"{enctype}><input type="hidden" name="token" value="{token}">'
             f'<input type="hidden" name="action" value="{action}">{body}</form>')
+
+
+def xlsx_products(raw):
+    def xml(archive, path):
+        if archive.getinfo(path).file_size > 24 * 1024 * 1024:
+            raise FormError("Лист Excel слишком большой.")
+        content = archive.read(path).decode("utf-8-sig")
+        if "<!DOCTYPE" in content.upper():
+            raise FormError("Не поддерживается этот формат листа Excel.")
+        return ET.fromstring(content)
+
+    def string(element):
+        return "".join(node.text or "" for node in element.iter(XLSX_NS + "t"))
+
+    def cells(row, strings):
+        values = {}
+        for cell in row.findall(XLSX_NS + "c"):
+            column = re.match(r"[A-Z]+", cell.get("r", ""))
+            if not column or cell.find(XLSX_NS + "f") is not None:
+                continue
+            value = cell.findtext(XLSX_NS + "v", "")
+            kind = cell.get("t")
+            if kind == "s":
+                value = strings[int(value)]
+            elif kind == "inlineStr":
+                value = string(cell)
+            values[column[0]] = value.strip()
+        return values
+
+    try:
+        with ZipFile(io.BytesIO(raw)) as archive:
+            members = archive.namelist()
+            strings = []
+            if "xl/sharedStrings.xml" in members:
+                strings = [string(entry) for entry in xml(archive, "xl/sharedStrings.xml")]
+            sheets = [name for name in members if re.fullmatch(r"xl/worksheets/sheet[0-9]+\.xml", name)]
+            for sheet in sheets[:10]:
+                rows = iter(xml(archive, sheet).iter(XLSX_NS + "row"))
+                for index, row in enumerate(rows):
+                    if index >= 20:
+                        break
+                    headings = {value.casefold(): col for col, value in cells(row, strings).items()}
+                    if {"идентификатор", "название товара"} <= headings.keys():
+                        return read_product_rows(rows, strings, cells, headings)
+    except (BadZipFile, ET.ParseError, OSError, ValueError, IndexError, KeyError, RuntimeError) as exc:
+        if isinstance(exc, FormError):
+            raise
+        raise FormError("Не удалось прочитать Excel. Загрузите выгрузку «Сводный прайс» в формате .xlsx.") from None
+    raise FormError("В файле нет колонок «Идентификатор» и «Название товара».")
+
+
+def read_product_rows(rows, strings, cells, headings):
+    products = {}
+    invalid = duplicates = 0
+    for row in rows:
+        values = cells(row, strings)
+        if not any(values.values()):
+            continue
+        item = values.get(headings["идентификатор"], "")
+        name = values.get(headings["название товара"], "")
+        match = re.fullmatch(r"#?([0-9]{1,120})(?:\.0+)?", item)
+        if match:
+            item = match[1]
+        elif re.fullmatch(r"[0-9]{1,120}(?:\.[0-9]{1,120})?[Ee][+-]?[0-9]{1,3}", item):
+            number = Decimal(item)
+            item = str(int(number)) if number.adjusted() < 120 and number == number.to_integral_value() else ""
+        else:
+            item = ""
+        if not item or not name or len(name) > 120:
+            invalid += 1
+            continue
+        if item in products:
+            duplicates += 1
+        else:
+            products[item] = name
+    return products, invalid, duplicates
+
+
+def import_xlsx(raw):
+    products, invalid, duplicates = xlsx_products(raw)
+    with database() as db:
+        db.executemany("INSERT OR IGNORE INTO watch(item,name,target) VALUES(?,?,NULL)", products.items())
+        inserted = db.total_changes
+    return inserted, len(products) - inserted, invalid, duplicates
 
 
 def model_chooser(selected, models, term, checked, form):
@@ -539,6 +629,12 @@ def page(query, error="", addition=None, *, editor=False, csrf_token=TOKEN):
             "%d.%m.%Y %H:%M UTC") if market_checked else "ожидается"
     currency = esc(OPTIONS.get("currency", "BYN"))
     add_feedback = ""
+    import_result = query.get("import_result")
+    if isinstance(import_result, tuple):
+        inserted, already, invalid, duplicates = import_result
+        add_feedback = (f'<p class="add-feedback" role="status">Добавлено: {inserted}. '
+                        f'Уже отслеживаются: {already}. Дубли в файле: {duplicates}. '
+                        f'Строки с пропусками или ошибками: {invalid}.</p>')
     if addition:
         added_item, created = addition
         added = next((row for row in rows if row["item"] == added_item), None)
@@ -604,6 +700,10 @@ def page(query, error="", addition=None, *, editor=False, csrf_token=TOKEN):
     add = render_form("add", f'<label>ID товара<input name="item" required maxlength="120" autocomplete="off" value="{esc(query.get("add_id", [""])[0])}"></label>'
                f'<label>Название товара<input name="name" maxlength="120" value="{input_name}"></label>'
                '<button>Добавить по ID</button>', "fields")
+    upload = render_form("import_xlsx",
+        '<label>Выгрузка избранного ShopManager (.xlsx)<input type="file" name="workbook" '
+        'accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" required></label>'
+        '<button>Импортировать избранное</button>', "fields search", multipart=True)
     settings = "" if editor else render_form("settings",
         f'<label>Ссылка на CSV конкурентов<input type="password" autocomplete="off" name="competitor_url" '
         f'value="{esc(OPTIONS.get("competitor_url") or "")}"></label>'
@@ -712,7 +812,8 @@ def page(query, error="", addition=None, *, editor=False, csrf_token=TOKEN):
     {add}
     <form method="get" class="search"><label>Поиск ID в последней выгрузке<input name="q" value="{esc(search)}"></label>
     <button class="quiet">Найти</button></form>
-    {"<ul class='matches'>" + "".join(search_results) + "</ul>" if search_results else ("<p>Совпадений нет</p>" if search else "")}</section>
+    {"<ul class='matches'>" + "".join(search_results) + "</ul>" if search_results else ("<p>Совпадений нет</p>" if search else "")}
+    {upload}</section>
     {history if not choosing else ""}{administration}
     </main></html>"""
 
@@ -755,6 +856,9 @@ class Handler(BaseHTTPRequestHandler):
         data = {}
         try:
             length = int(self.headers.get("Content-Length", "0"))
+            if self.headers.get_content_type() == "multipart/form-data":
+                self.upload_workbook(length)
+                return
             if not 0 < length <= 16384:
                 self.send_error(413)
                 return
@@ -810,6 +914,36 @@ class Handler(BaseHTTPRequestHandler):
             self.render({}, f"Операция не выполнена ({type(exc).__name__}).", 400)
         except Exception as exc:
             self.render({}, f"Данные не обработаны ({type(exc).__name__}).", 502)
+
+    def upload_workbook(self, length):
+        try:
+            if not 0 < length <= IMPORT_LIMIT + 4096:
+                raise FormError("Размер файла Excel должен быть не больше 5 МБ.")
+            content_type = self.headers["Content-Type"].encode("ascii")
+            message = BytesParser(policy=email_policy).parsebytes(
+                b"Content-Type: " + content_type + b"\r\n\r\n" + self.rfile.read(length))
+            if not message.is_multipart():
+                raise FormError("Не удалось получить файл Excel.")
+            fields = {part.get_param("name", header="content-disposition"): part
+                      for part in message.iter_parts()
+                      if part.get_content_disposition() == "form-data"}
+            payload = {name: part.get_payload(decode=True) for name, part in fields.items()}
+            if not secrets.compare_digest(payload.get("token") or b"", self.csrf_token.encode("ascii")):
+                self.send_error(403)
+                return
+            if payload.get("action") != b"import_xlsx":
+                self.send_error(400)
+                return
+            entry = fields.get("workbook")
+            raw = payload.get("workbook")
+            if not entry or not (entry.get_filename() or "").lower().endswith(".xlsx") or not raw:
+                raise FormError("Выберите выгрузку ShopManager в формате .xlsx.")
+            if len(raw) > IMPORT_LIMIT:
+                raise FormError("Размер файла Excel должен быть не больше 5 МБ.")
+            counts = import_xlsx(raw)
+            self.render({"import_result": counts})
+        except FormError as exc:
+            self.render({"add_error": ["1"]}, str(exc), 400)
 
     def change(self, data, action):
         if action == "settings":

@@ -4,6 +4,7 @@ import html
 import io
 import ipaddress
 import json
+import math
 import os
 import re
 import secrets
@@ -420,6 +421,53 @@ def low_price_date(row):
     return datetime.fromtimestamp(row["low_captured"] + 3 * 3600, timezone.utc).strftime("%d.%m.%Y")
 
 
+def purchase_chart(db, item):
+    rows = db.execute("""
+        SELECT date(t.captured,'unixepoch','+3 hours') AS day, min(o.cost) AS price
+        FROM offers o JOIN snapshots t ON t.id=o.snapshot JOIN sources s ON s.id=o.source
+        WHERE o.item=? AND t.captured>=? AND o.stock>0 AND o.cost IS NOT NULL
+          AND s.role IN ('supplier','unassigned')
+          AND s.name NOT LIKE 'Парсер%' AND s.name NOT LIKE 'парсер%'
+        GROUP BY day ORDER BY day
+        """, (item, int(time.time()) - 90 * 86400)).fetchall()
+    heading = '<h3>Минимальная закупка за 90 дней</h3>'
+    if not rows:
+        return heading + '<p class="sub">Пока нет цен с подтверждённым остатком.</p>'
+    low = min(row["price"] for row in rows)
+    high = max(row["price"] for row in rows)
+    first = datetime.fromisoformat(rows[0]["day"])
+    last = datetime.fromisoformat(rows[-1]["day"])
+    span = (last - first).days
+    points = []
+    labels = []
+    values = []
+    for row in rows:
+        day = datetime.fromisoformat(row["day"])
+        price = amount(row["price"])
+        x = 50 if not span else 100 * (day - first).days / span
+        y = 50 if high == low else 100 * (high - row["price"]) / (high - low)
+        points.append((x, y))
+        date = day.strftime("%d.%m.%Y")
+        labels.append(f'<span class="chart-point" style="left:{x:.3f}%;top:{y:.3f}%" '
+                      f'title="{date} · {price}"></span>')
+        values.append(f'<li>{date} · {price}</li>')
+    segments = []
+    for (x, y), (next_x, next_y) in zip(points, points[1:]):
+        dx, dy = next_x - x, (next_y - y) / 2  # The chart is twice as wide as it is tall.
+        width = math.hypot(dx, dy)
+        angle = math.degrees(math.atan2(dy, dx))
+        gap = " chart-gap" if dx > 100 / max(span, 1) + 0.00001 else ""
+        segments.append(f'<span class="chart-line{gap}" style="left:{x:.3f}%;top:{y:.3f}%;'
+                        f'width:{width:.3f}%;transform:rotate({angle:.3f}deg)"></span>')
+    currency = esc(OPTIONS.get("currency", "BYN"))
+    limits = f'{amount(low)} {currency}' if low == high else f'{amount(low)}–{amount(high)} {currency}'
+    return (f'{heading}<p class="sub">Лучшая цена в наличии за день · {limits}</p>'
+            f'<div class="purchase-chart" aria-hidden="true">{"".join(segments + labels)}</div>'
+            f'<div class="chart-dates" aria-hidden="true"><span>{first:%d.%m.%Y}</span>'
+            f'<span>{last.strftime("%d.%m.%Y") if span else ""}</span></div>'
+            f'<details class="chart-values"><summary>Цены по дням</summary><ul>{"".join(values)}</ul></details>')
+
+
 def purchase_trend(current, previous):
     if current is None or previous is None or current == previous:
         return ""
@@ -812,6 +860,7 @@ def page(query, error="", addition=None, *, editor=False, csrf_token=TOKEN):
             s.name, o.retail, o.cost, o.stock FROM offers o JOIN snapshots t ON t.id=o.snapshot
             JOIN sources s ON s.id=o.source WHERE o.item=? ORDER BY o.snapshot DESC, s.name LIMIT 200
             """, (item,)).fetchall() if item else []
+        chart = purchase_chart(db, item) if item and not choosing else ""
     refreshed = datetime.fromtimestamp(checked, timezone.utc).strftime("%d.%m.%Y %H:%M UTC") if checked else "ожидается"
     market_time = "источник не настроен" if editor else "укажите ссылку в разделе «Источники данных»"
     if OPTIONS.get("competitor_url"):
@@ -941,7 +990,7 @@ def page(query, error="", addition=None, *, editor=False, csrf_token=TOKEN):
                                f'<td>{esc(row["stock"] if row["stock"] is not None else "—")}</td></tr>'
                                for row in details)
         heading = selected["name"] if selected else (known["name"] if known else f"Товар {item}")
-        history = f'<section id="product-details"><h2>{esc(heading)}</h2>{edit}<h3>История цен</h3><div class="table"><table><thead><tr><th>Минск</th>'
+        history = f'<section id="product-details"><h2>{esc(heading)}</h2>{edit}{chart}<h3>История цен</h3><div class="table"><table><thead><tr><th>Минск</th>'
         history += '<th>Источник</th><th>Цена</th><th>Закупка</th><th>Остаток</th></tr></thead>'
         history += f'<tbody>{history_rows}</tbody></table></div></section>'
         if market_rows:
@@ -1051,6 +1100,15 @@ def page(query, error="", addition=None, *, editor=False, csrf_token=TOKEN):
     .model-option{{display:grid;grid-template-columns:auto 1fr auto;gap:12px;align-items:center;
       padding:10px;border-bottom:1px solid #edf1ef;cursor:pointer}}
     .model-option input{{width:auto;margin:0}} .model-actions{{display:flex;flex-wrap:wrap;gap:12px;margin-top:12px}}
+    .purchase-chart{{position:relative;aspect-ratio:2;max-width:36rem;
+      margin:12px 4px 8px;background:repeating-linear-gradient(to bottom,#dce6e3 0 1px,transparent 1px 25%);
+      box-shadow:inset 0 -1px #dce6e3}}
+    .chart-line,.chart-point{{position:absolute;background:#126451}}
+    .chart-line{{height:2px;transform-origin:left center;margin-top:-1px;pointer-events:none}}
+    .chart-gap{{background:repeating-linear-gradient(to right,#126451 0 4px,transparent 4px 8px)}}
+    .chart-point{{width:7px;height:7px;border-radius:50%;transform:translate(-50%,-50%)}}
+    .chart-dates{{display:flex;justify-content:space-between;max-width:36rem;color:#526761;font-size:14px}}
+    .chart-values{{padding:10px 14px;margin-top:10px}}
     </style><main><header><div><h1><a href="?">Монитор закупок</a></h1><p>ShopManager · {refreshed}<br>
     Конкуренты · {market_time} · {currency}{shops_link}</p></div>{sync_button}</header>
     {navigation}{problem}{form_problem if item else ""}
